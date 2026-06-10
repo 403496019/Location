@@ -23,11 +23,24 @@ import dev.lerist.fakelocation.injector.InjectionPreflightReport
 import dev.lerist.fakelocation.injector.InjectionPlan
 import dev.lerist.fakelocation.injector.InjectionTask
 import dev.lerist.fakelocation.injector.InjectionTaskExecution
+import dev.lerist.fakelocation.injector.GeneratedRootScript
 import dev.lerist.fakelocation.injector.InjectorEnvironment
+import dev.lerist.fakelocation.injector.RootScriptBundle
+import dev.lerist.fakelocation.injector.RootScriptMode
 import dev.lerist.fakelocation.injector.RuntimeMirrorSyncResult
 import dev.lerist.fakelocation.payload.PayloadActivationReport
 import dev.lerist.fakelocation.payload.SharedPayloadEntrypoint
 import java.io.File
+
+data class LocationChainProbe(
+    val simulatedConsumer: String,
+    val hookInstalled: Boolean,
+    val serviceRegistered: Boolean,
+    val sessionLocationEnabled: Boolean,
+    val resolvedLocation: MockLocation?,
+    val success: Boolean,
+    val notes: List<String>,
+)
 
 data class RuntimeSnapshot(
     val runtimePrepared: Boolean,
@@ -45,8 +58,11 @@ data class RuntimeSnapshot(
     val injectorEnvironment: InjectorEnvironment?,
     val rootProbeReport: CommandExecutionReport?,
     val runtimeMirrorSyncResult: RuntimeMirrorSyncResult?,
+    val rootScriptBundle: RootScriptBundle?,
+    val generatedRootScripts: List<GeneratedRootScript>,
     val registeredServices: List<String>,
     val sessionState: MockSessionState,
+    val locationChainProbe: LocationChainProbe,
     val injectionPlans: List<InjectionPlan>,
     val injectionTasks: List<InjectionTask>,
     val taskExecutions: List<InjectionTaskExecution>,
@@ -80,6 +96,7 @@ class Phase1RuntimeController(
     private var injectorEnvironment: InjectorEnvironment? = null
     private var rootProbeReport: CommandExecutionReport? = null
     private var runtimeMirrorSyncResult: RuntimeMirrorSyncResult? = null
+    private var rootScriptBundle: RootScriptBundle? = null
     private var taskExecutions: List<InjectionTaskExecution> = emptyList()
     private val payloadReports = mutableListOf<PayloadActivationReport>()
 
@@ -90,6 +107,7 @@ class Phase1RuntimeController(
         }
         val report = preparationReport
         if (report != null) {
+            rootScriptBundle = injectionOrchestrator.buildRootScriptBundle(report)
             runtimeIntegrityReport = assetManager.verifyPreparationReport(report)
             injectionPreflightReport = injectionOrchestrator.buildPreflightReport(report)
         }
@@ -159,6 +177,7 @@ class Phase1RuntimeController(
         val report = preparationReport ?: return snapshot()
         injectorEnvironment = injectionOrchestrator.probeInjectorEnvironment()
         runtimeMirrorSyncResult = injectionOrchestrator.executeRuntimeMirrorSync(report)
+        rootScriptBundle = injectionOrchestrator.buildRootScriptBundle(report)
         runtimeIntegrityReport = assetManager.verifyPreparationReport(report)
         injectionPreflightReport = injectionOrchestrator.buildPreflightReport(report)
         return snapshot()
@@ -168,6 +187,7 @@ class Phase1RuntimeController(
         bootstrap()
         val report = preparationReport ?: return snapshot()
         injectorEnvironment = injectionOrchestrator.probeInjectorEnvironment()
+        rootScriptBundle = injectionOrchestrator.buildRootScriptBundle(report)
         runtimeIntegrityReport = assetManager.verifyPreparationReport(report)
         injectionPreflightReport = injectionOrchestrator.buildPreflightReport(report)
         return snapshot()
@@ -177,9 +197,24 @@ class Phase1RuntimeController(
         activateAppHookStage()
         val report = preparationReport ?: return snapshot()
         injectorEnvironment = injectionOrchestrator.probeInjectorEnvironment()
+        rootScriptBundle = injectionOrchestrator.buildRootScriptBundle(report)
         runtimeIntegrityReport = assetManager.verifyPreparationReport(report)
         injectionPreflightReport = injectionOrchestrator.buildPreflightReport(report)
         taskExecutions = injectionOrchestrator.executeDryRunTasks(report)
+        return snapshot()
+    }
+
+    fun executeRootInjectionTasks(): RuntimeSnapshot {
+        activateAppHookStage()
+        val report = preparationReport ?: return snapshot()
+        injectorEnvironment = injectionOrchestrator.probeInjectorEnvironment()
+        rootScriptBundle = injectionOrchestrator.buildRootScriptBundle(report)
+        runtimeIntegrityReport = assetManager.verifyPreparationReport(report)
+        injectionPreflightReport = injectionOrchestrator.buildPreflightReport(report)
+        taskExecutions = injectionOrchestrator.executeTasks(
+            report = report,
+            mode = RootScriptMode.EXECUTE,
+        )
         return snapshot()
     }
 
@@ -201,8 +236,11 @@ class Phase1RuntimeController(
             injectorEnvironment = injectorEnvironment,
             rootProbeReport = rootProbeReport,
             runtimeMirrorSyncResult = runtimeMirrorSyncResult,
+            rootScriptBundle = rootScriptBundle ?: injectionOrchestrator.getLastScriptBundle(),
+            generatedRootScripts = rootScriptBundle?.scripts.orEmpty(),
             registeredServices = serviceRegistry.listServiceNames(),
             sessionState = stateStore.getState(),
+            locationChainProbe = buildLocationChainProbe(),
             injectionPlans = injectionOrchestrator.defaultPlans(),
             injectionTasks = report?.let(injectionOrchestrator::buildInjectionTasks).orEmpty(),
             taskExecutions = taskExecutions,
@@ -212,6 +250,47 @@ class Phase1RuntimeController(
     }
 
     fun isNativeHookReady(): Boolean = nativeCatchManager.isHookEngineReady()
+
+    private fun buildLocationChainProbe(): LocationChainProbe {
+        val state = stateStore.getState()
+        val hookInstalled = nativeHookBridge.hasInstalledHook(
+            targetClassName = "com.android.server.location.LocationManagerService",
+            targetMethodName = "getLastLocation",
+        )
+        val serviceRegistered = serviceRegistry.isRegistered("service_fl_ml")
+        val sessionLocationEnabled = state.toggles.locationEnabled
+        val resolvedLocation = if (hookInstalled && serviceRegistered && sessionLocationEnabled) {
+            state.currentLocation
+        } else {
+            null
+        }
+        val notes = buildList {
+            if (!hookInstalled) {
+                add("LocationManagerService.getLastLocation is not installed in the simulated native hook registry")
+            }
+            if (!serviceRegistered) {
+                add("service_fl_ml is not registered")
+            }
+            if (!sessionLocationEnabled) {
+                add("mock location toggle is disabled")
+            }
+            if (state.currentLocation == null) {
+                add("no current mock location is staged")
+            }
+            if (resolvedLocation != null) {
+                add("simulated system_server consumer resolved the staged mock location")
+            }
+        }
+        return LocationChainProbe(
+            simulatedConsumer = "com.android.server.location.LocationManagerService#getLastLocation",
+            hookInstalled = hookInstalled,
+            serviceRegistered = serviceRegistered,
+            sessionLocationEnabled = sessionLocationEnabled,
+            resolvedLocation = resolvedLocation,
+            success = resolvedLocation != null,
+            notes = notes,
+        )
+    }
 
     private fun defaultDemoLocation(): MockLocation {
         return MockLocation(

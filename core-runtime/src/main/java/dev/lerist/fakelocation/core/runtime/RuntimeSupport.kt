@@ -2,7 +2,9 @@ package dev.lerist.fakelocation.core.runtime
 
 import android.content.Context
 import android.os.Build
+import java.io.BufferedInputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.security.MessageDigest
 
 enum class RuntimeArtifactKind {
@@ -16,6 +18,7 @@ enum class RuntimeArtifactKind {
 data class RuntimeAssetDescriptor(
     val logicalName: String,
     val relativePath: String,
+    val assetRelativePath: String? = null,
     val abi: String? = null,
     val kind: RuntimeArtifactKind,
     val versionTag: String,
@@ -37,6 +40,7 @@ data class RuntimeLayoutSnapshot(
     val payloadRoot: File,
     val nativeRoot: File,
     val injectorRoot: File,
+    val scriptsRoot: File,
     val metadataRoot: File,
     val logsRoot: File,
     val manifestFile: File,
@@ -49,6 +53,7 @@ data class RuntimeLayoutSnapshot(
             payloadRoot,
             nativeRoot,
             injectorRoot,
+            scriptsRoot,
             metadataRoot,
             logsRoot,
         )
@@ -106,20 +111,26 @@ class RuntimeAssetManager(private val context: Context) {
         val artifacts = descriptors.map { descriptor ->
             val targetFile = File(layout.stagedRoot, descriptor.relativePath)
             targetFile.parentFile?.mkdirs()
-            targetFile.writeText(buildPlaceholderContent(descriptor))
+            val materializedFromAsset = materializeAssetIfPresent(descriptor, targetFile)
+            if (!materializedFromAsset) {
+                targetFile.writeText(buildArtifactContent(descriptor))
+                if (descriptor.kind == RuntimeArtifactKind.INJECTOR) {
+                    targetFile.setExecutable(true, false)
+                }
+            }
             StagedRuntimeArtifact(
                 descriptor = descriptor,
                 privateFile = targetFile,
                 sharedPathHint = File(layout.sharedRootHint, descriptor.relativePath).absolutePath,
                 sizeBytes = targetFile.length(),
                 sha256 = sha256Of(targetFile),
-                isPlaceholder = true,
+                isPlaceholder = !materializedFromAsset,
             )
         }
         val report = RuntimePreparationReport(
             layout = layout,
             artifacts = artifacts,
-            manifestVersion = "phase1-runtime-v2",
+            manifestVersion = "phase1-runtime-v4",
             generatedAtMillis = System.currentTimeMillis(),
         )
         layout.manifestFile.writeText(buildManifest(report))
@@ -193,15 +204,17 @@ class RuntimeAssetManager(private val context: Context) {
         val payloadRoot = File(stagedRoot, "payload")
         val nativeRoot = File(stagedRoot, "native")
         val injectorRoot = File(stagedRoot, "bin")
+        val scriptsRoot = File(stagedRoot, "scripts")
         val metadataRoot = File(stagedRoot, "metadata")
         val logsRoot = File(privateRoot, "logs")
-        val manifestFile = File(metadataRoot, "runtime-manifest-v2.txt")
+        val manifestFile = File(metadataRoot, "runtime-manifest-v4.txt")
         RuntimeLayoutSnapshot(
             privateRoot = privateRoot,
             stagedRoot = stagedRoot,
             payloadRoot = payloadRoot,
             nativeRoot = nativeRoot,
             injectorRoot = injectorRoot,
+            scriptsRoot = scriptsRoot,
             metadataRoot = metadataRoot,
             logsRoot = logsRoot,
             manifestFile = manifestFile,
@@ -216,6 +229,7 @@ class RuntimeAssetManager(private val context: Context) {
             payloadRoot = payloadRoot,
             nativeRoot = nativeRoot,
             injectorRoot = injectorRoot,
+            scriptsRoot = scriptsRoot,
             metadataRoot = metadataRoot,
             logsRoot = logsRoot,
             manifestFile = manifestFile,
@@ -228,6 +242,7 @@ class RuntimeAssetManager(private val context: Context) {
             RuntimeAssetDescriptor(
                 logicalName = "java_payload_main",
                 relativePath = "payload/2da3c574.s",
+                assetRelativePath = null,
                 kind = RuntimeArtifactKind.JAVA_PAYLOAD,
                 versionTag = "phase1-demo",
                 sourceTag = "round15-confirmed-entry",
@@ -235,34 +250,38 @@ class RuntimeAssetManager(private val context: Context) {
             RuntimeAssetDescriptor(
                 logicalName = "loader_init_arm64",
                 relativePath = "native/libfl_init64.so",
+                assetRelativePath = "runtime/native/libfl_init64.so",
                 abi = "arm64-v8a",
                 kind = RuntimeArtifactKind.NATIVE_LOADER,
-                versionTag = "phase1-demo",
-                sourceTag = "analysis-aligned-placeholder",
+                versionTag = "phase1-native-v1",
+                sourceTag = "native-runtime-cmake",
             ),
             RuntimeAssetDescriptor(
                 logicalName = "loader_app_arm64",
                 relativePath = "native/libfl_app64.so",
+                assetRelativePath = "runtime/native/libfl_app64.so",
                 abi = "arm64-v8a",
                 kind = RuntimeArtifactKind.NATIVE_LOADER,
-                versionTag = "phase1-demo",
-                sourceTag = "analysis-aligned-placeholder",
+                versionTag = "phase1-native-v1",
+                sourceTag = "native-runtime-cmake",
             ),
             RuntimeAssetDescriptor(
                 logicalName = "hook_bridge_arm64",
                 relativePath = "native/liblh64.so",
+                assetRelativePath = "runtime/native/liblh64.so",
                 abi = "arm64-v8a",
                 kind = RuntimeArtifactKind.HOOK_BRIDGE,
-                versionTag = "phase1-demo",
-                sourceTag = "analysis-aligned-placeholder",
+                versionTag = "phase1-native-v1",
+                sourceTag = "native-runtime-cmake",
             ),
             RuntimeAssetDescriptor(
                 logicalName = "injector_arm64",
                 relativePath = "bin/inj64",
+                assetRelativePath = "runtime/bin/inj64",
                 abi = "arm64-v8a",
                 kind = RuntimeArtifactKind.INJECTOR,
-                versionTag = "phase1-demo",
-                sourceTag = "analysis-aligned-placeholder",
+                versionTag = "phase1-native-v1",
+                sourceTag = "native-runtime-cmake",
             ),
             RuntimeAssetDescriptor(
                 logicalName = "hook_registry_seed",
@@ -272,6 +291,49 @@ class RuntimeAssetManager(private val context: Context) {
                 sourceTag = "payload-bridge-seed",
             ),
         )
+    }
+
+    private fun materializeAssetIfPresent(
+        descriptor: RuntimeAssetDescriptor,
+        targetFile: File,
+    ): Boolean {
+        val assetPath = descriptor.assetRelativePath ?: return false
+        return try {
+            context.assets.open(assetPath).use { input ->
+                BufferedInputStream(input).use { buffered ->
+                    FileOutputStream(targetFile).use { output ->
+                        buffered.copyTo(output)
+                    }
+                }
+            }
+            if (descriptor.kind == RuntimeArtifactKind.INJECTOR) {
+                targetFile.setExecutable(true, false)
+            }
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun buildArtifactContent(descriptor: RuntimeAssetDescriptor): String {
+        if (descriptor.kind == RuntimeArtifactKind.INJECTOR) {
+            return buildInjectorStubContent(descriptor)
+        }
+        if (descriptor.logicalName == "hook_registry_seed") {
+            return buildHookRegistrySeedContent()
+        }
+        return buildPlaceholderContent(descriptor)
+    }
+
+    private fun buildHookRegistrySeedContent(): String {
+        return buildString {
+            appendLine("version=phase1-seed-v1")
+            appendLine("process=system_server stage=init hook=com.android.server.location.LocationManagerService#getLastLocation")
+            appendLine("process=com.android.phone stage=appHook hook=com.android.phone.PhoneInterfaceManager#getAllCellInfo")
+            appendLine("process=app stage=compat hook=android.net.wifi.WifiManager#getScanResults")
+            appendLine("note=seed file consumed by native hook bridge and loader stubs")
+            appendLine("generatedAtMillis=${System.currentTimeMillis()}")
+        }
     }
 
     private fun buildPlaceholderContent(descriptor: RuntimeAssetDescriptor): String {
@@ -289,6 +351,186 @@ class RuntimeAssetManager(private val context: Context) {
             appendLine("supported32BitAbis=${Build.SUPPORTED_32_BIT_ABIS.joinToString()}")
             appendLine("generatedAtMillis=${System.currentTimeMillis()}")
         }
+    }
+
+    private fun buildInjectorStubContent(descriptor: RuntimeAssetDescriptor): String {
+        return """
+            |#!/system/bin/sh
+            |set -eu
+            |
+            |TARGET_PROCESS=""
+            |STAGE=""
+            |ABI=""
+            |LOADER=""
+            |HOOK_BRIDGE=""
+            |PAYLOAD=""
+            |ENTRYPOINT=""
+            |LOG_FILE=""
+            |DRY_RUN=0
+            |
+            |while [ ${'$'}# -gt 0 ]; do
+            |  case "${'$'}1" in
+            |    --target-process)
+            |      TARGET_PROCESS="${'$'}2"
+            |      shift 2
+            |      ;;
+            |    --stage)
+            |      STAGE="${'$'}2"
+            |      shift 2
+            |      ;;
+            |    --abi)
+            |      ABI="${'$'}2"
+            |      shift 2
+            |      ;;
+            |    --loader)
+            |      LOADER="${'$'}2"
+            |      shift 2
+            |      ;;
+            |    --hook-bridge)
+            |      HOOK_BRIDGE="${'$'}2"
+            |      shift 2
+            |      ;;
+            |    --payload)
+            |      PAYLOAD="${'$'}2"
+            |      shift 2
+            |      ;;
+            |    --entry)
+            |      ENTRYPOINT="${'$'}2"
+            |      shift 2
+            |      ;;
+            |    --log-file)
+            |      LOG_FILE="${'$'}2"
+            |      shift 2
+            |      ;;
+            |    --dry-run)
+            |      DRY_RUN=1
+            |      shift
+            |      ;;
+            |    *)
+            |      echo "inj64-stub: unknown argument: ${'$'}1" >&2
+            |      exit 64
+            |      ;;
+            |  esac
+            |done
+            |
+            |require_value() {
+            |  NAME="${'$'}1"
+            |  VALUE="${'$'}2"
+            |  if [ -z "${'$'}VALUE" ]; then
+            |    echo "inj64-stub: missing required argument ${'$'}NAME" >&2
+            |    exit 65
+            |  fi
+            |}
+            |
+            |require_file() {
+            |  PATH_VALUE="${'$'}1"
+            |  LABEL="${'$'}2"
+            |  if [ ! -f "${'$'}PATH_VALUE" ]; then
+            |    echo "inj64-stub: missing ${'$'}LABEL file: ${'$'}PATH_VALUE" >&2
+            |    exit 66
+            |  fi
+            |}
+            |
+            |require_value "--target-process" "${'$'}TARGET_PROCESS"
+            |require_value "--stage" "${'$'}STAGE"
+            |require_value "--abi" "${'$'}ABI"
+            |require_value "--loader" "${'$'}LOADER"
+            |require_value "--hook-bridge" "${'$'}HOOK_BRIDGE"
+            |require_value "--payload" "${'$'}PAYLOAD"
+            |require_value "--entry" "${'$'}ENTRYPOINT"
+            |
+            |require_file "${'$'}PAYLOAD" "payload"
+            |require_file "${'$'}LOADER" "loader"
+            |require_file "${'$'}HOOK_BRIDGE" "hook bridge"
+            |
+            |log_phase() {
+            |  PHASE_NAME="${'$'}1"
+            |  PHASE_STATUS="${'$'}2"
+            |  PHASE_DETAIL="${'$'}3"
+            |  TS="$(date +%s 2>/dev/null || echo 0)"
+            |  echo "phase=${'$'}PHASE_NAME status=${'$'}PHASE_STATUS ts=${'$'}TS detail=${'$'}PHASE_DETAIL" | tee -a "${'$'}LOG_FILE"
+            |}
+            |
+            |PID="$(pidof "${'$'}TARGET_PROCESS" 2>/dev/null | awk '{print ${'$'}1}')"
+            |SELINUX="$(getenforce 2>/dev/null || echo unknown)"
+            |if [ -z "${'$'}LOG_FILE" ]; then
+            |  SAFE_NAME="$(echo "${'$'}TARGET_PROCESS" | tr '.:' '__')"
+            |  LOG_FILE="/data/fl/logs/inj64_${'$'}SAFE_NAME_${'$'}STAGE.log"
+            |fi
+            |
+            |mkdir -p "$(dirname "${'$'}LOG_FILE")" 2>/dev/null || true
+            |{
+            |  echo "[inj64-stub] logicalName=${descriptor.logicalName}"
+            |  echo "target_process=${'$'}TARGET_PROCESS"
+            |  echo "stage=${'$'}STAGE"
+            |  echo "abi=${'$'}ABI"
+            |  echo "entrypoint=${'$'}ENTRYPOINT"
+            |  echo "selinux=${'$'}SELINUX"
+            |  echo "pid=${'$'}PID"
+            |  echo "loader=${'$'}LOADER"
+            |  echo "hook_bridge=${'$'}HOOK_BRIDGE"
+            |  echo "payload=${'$'}PAYLOAD"
+            |  echo "generated_by=${context.packageName}"
+            |  echo "generated_at=${System.currentTimeMillis()}"
+            |} >> "${'$'}LOG_FILE"
+            |
+            |if [ -z "${'$'}PID" ]; then
+            |  log_phase attach failed "target process missing"
+            |  echo "inj64-stub: target process not running: ${'$'}TARGET_PROCESS" >&2
+            |  exit 67
+            |fi
+            |
+            |if [ "${'$'}DRY_RUN" = "1" ]; then
+            |  log_phase preflight ok "dry-run only"
+            |  echo "inj64-stub dry-run ok target=${'$'}TARGET_PROCESS pid=${'$'}PID stage=${'$'}STAGE selinux=${'$'}SELINUX log=${'$'}LOG_FILE"
+            |  exit 0
+            |fi
+            |
+            |if [ "${'$'}SELINUX" = "Enforcing" ]; then
+            |  echo "inj64-stub: warning selinux enforcing; original workflow usually expects permissive" | tee -a "${'$'}LOG_FILE"
+            |fi
+            |
+            |log_phase attach ok "pid=${'$'}PID target=${'$'}TARGET_PROCESS"
+            |sleep 1
+            |log_phase loader_prepare ok "loader=${'$'}LOADER abi=${'$'}ABI"
+            |sleep 1
+            |if grep -q '^placeholder=true' "${'$'}LOADER" 2>/dev/null; then
+            |  log_phase loader_prepare warning "loader artifact is placeholder"
+            |fi
+            |log_phase hook_bridge_prepare ok "bridge=${'$'}HOOK_BRIDGE"
+            |sleep 1
+            |if grep -q '^placeholder=true' "${'$'}HOOK_BRIDGE" 2>/dev/null; then
+            |  log_phase hook_bridge_prepare warning "hook bridge artifact is placeholder"
+            |fi
+            |log_phase payload_resolve ok "payload=${'$'}PAYLOAD"
+            |sleep 1
+            |if grep -q '^placeholder=true' "${'$'}PAYLOAD" 2>/dev/null; then
+            |  log_phase payload_resolve warning "payload artifact is placeholder"
+            |fi
+            |log_phase entry_dispatch ok "entry=${'$'}ENTRYPOINT stage=${'$'}STAGE"
+            |sleep 1
+            |log_phase finalize ok "marker will be written"
+            |
+            |SAFE_NAME="$(echo "${'$'}TARGET_PROCESS" | tr '.:' '__')"
+            |MARKER_FILE="/data/fl/logs/last_injection_${'$'}SAFE_NAME_${'$'}STAGE.txt"
+            |{
+            |  echo "status=stubbed_state_machine"
+            |  echo "target_process=${'$'}TARGET_PROCESS"
+            |  echo "pid=${'$'}PID"
+            |  echo "stage=${'$'}STAGE"
+            |  echo "entrypoint=${'$'}ENTRYPOINT"
+            |  echo "selinux=${'$'}SELINUX"
+            |  echo "log_file=${'$'}LOG_FILE"
+            |  echo "loader=${'$'}LOADER"
+            |  echo "hook_bridge=${'$'}HOOK_BRIDGE"
+            |  echo "payload=${'$'}PAYLOAD"
+            |  echo "phases=attach,loader_prepare,hook_bridge_prepare,payload_resolve,entry_dispatch,finalize"
+            |} > "${'$'}MARKER_FILE"
+            |
+            |log_phase marker ok "marker=${'$'}MARKER_FILE"
+            |echo "inj64-stub execute ok target=${'$'}TARGET_PROCESS pid=${'$'}PID stage=${'$'}STAGE log=${'$'}LOG_FILE marker=${'$'}MARKER_FILE"
+            |exit 0
+        """.trimMargin()
     }
 
     private fun buildManifest(report: RuntimePreparationReport): String {

@@ -18,6 +18,7 @@ class MockCoordinatorService : Service() {
             ACTION_PROBE_ROOT -> appGraph.runtimeController.probeRootShell()
             ACTION_SYNC_RUNTIME_MIRROR -> appGraph.runtimeController.syncRuntimeMirror()
             ACTION_EXECUTE_DRY_RUN_TASKS -> appGraph.runtimeController.executeDryRunInjectionTasks()
+            ACTION_EXECUTE_ROOT_TASKS -> appGraph.runtimeController.executeRootInjectionTasks()
         }
         return START_NOT_STICKY
     }
@@ -37,5 +38,7 @@ class MockCoordinatorService : Service() {
         const val ACTION_SYNC_RUNTIME_MIRROR = "dev.lerist.fakelocation.action.SYNC_RUNTIME_MIRROR"
         const val ACTION_EXECUTE_DRY_RUN_TASKS =
             "dev.lerist.fakelocation.action.EXECUTE_DRY_RUN_TASKS"
+        const val ACTION_EXECUTE_ROOT_TASKS =
+            "dev.lerist.fakelocation.action.EXECUTE_ROOT_TASKS"
     }
 }

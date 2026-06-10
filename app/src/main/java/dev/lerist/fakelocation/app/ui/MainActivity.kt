@@ -76,6 +76,10 @@ class MainActivity : ComponentActivity() {
                 startCoordinator(MockCoordinatorService.ACTION_EXECUTE_DRY_RUN_TASKS)
                 refreshSnapshot()
             })
+            addView(actionButton("Execute Root Scripts") {
+                startCoordinator(MockCoordinatorService.ACTION_EXECUTE_ROOT_TASKS)
+                refreshSnapshot()
+            })
             addView(actionButton("Refresh Snapshot") {
                 refreshSnapshot()
             })
@@ -143,18 +147,46 @@ class MainActivity : ComponentActivity() {
         val wifiText = state.currentWifiProfile?.let {
             "${it.ssid} / ${it.bssid} / ${it.frequencyMhz}MHz / ${it.rssiDbm}dBm"
         } ?: "none"
+        val locationProbe = snapshot.locationChainProbe
+        val locationProbeText = buildString {
+            append("consumer=${locationProbe.simulatedConsumer}, ")
+            append("hookInstalled=${locationProbe.hookInstalled}, ")
+            append("serviceRegistered=${locationProbe.serviceRegistered}, ")
+            append("sessionLocationEnabled=${locationProbe.sessionLocationEnabled}, ")
+            append("success=${locationProbe.success}")
+        }
+        val locationProbeResolved = locationProbe.resolvedLocation?.let {
+            "${it.latitude}, ${it.longitude}, alt=${it.altitudeMeters}, acc=${it.accuracyMeters}, provider=${it.provider}"
+        } ?: "none"
+        val locationProbeNotes = locationProbe.notes.joinToString("\n") { "- $it" }.ifBlank { "- none" }
         val planLines = snapshot.injectionPlans.joinToString("\n") { plan ->
             "- ${plan.processName} | ${plan.role} | ${plan.stage} | ${plan.nativeLoaderName} | ${plan.javaEntrypoint}"
         }
         val taskLines = snapshot.injectionTasks.joinToString("\n") { task ->
-            "- ${task.plan.processName}: ${task.dryRunCommand}"
+            "- ${task.plan.processName}: dry=${task.dryRunCommand} | exec=${task.executeCommand}"
+        }.ifBlank { "- none" }
+        val scriptBundleText = snapshot.rootScriptBundle?.let { bundle ->
+            "root=${bundle.scriptRoot.absolutePath}, shared=${bundle.sharedScriptRootHint}, generatedAt=${bundle.generatedAtMillis}"
+        } ?: "none"
+        val scriptLines = snapshot.generatedRootScripts.joinToString("\n") { script ->
+            "- ${script.name}: target=${script.targetProcess ?: "runtime-sync"} | purpose=${script.purpose} | private=${script.privateFile.absolutePath} | shared=${script.sharedPathHint}"
         }.ifBlank { "- none" }
         val executionLines = snapshot.taskExecutions.joinToString("\n\n") { execution ->
             buildString {
-                append("- ${execution.task.plan.processName}: ${execution.report.summary}")
+                append("- ${execution.task.plan.processName}: mode=${execution.mode} ${execution.report.summary}")
                 append("\n  shell=${execution.report.shellKind} root=${execution.report.requestedRoot} exit=${execution.report.exitCode}")
+                append("\n  script=${execution.task.rootScript.sharedPathHint}")
+                append("\n  logFile=${execution.task.logFilePath}")
+                append("\n  markerFile=${execution.task.markerFilePath}")
+                append("\n  command=${if (execution.mode.argument == "execute") execution.task.executeCommand else execution.task.dryRunCommand}")
                 append("\n  stdout=${execution.report.stdout.ifBlank { "<empty>" }}")
                 append("\n  stderr=${execution.report.stderr.ifBlank { "<empty>" }}")
+                execution.artifactCapture?.let { capture ->
+                    append("\n  artifactInspect=${capture.inspectionReport.summary} exit=${capture.inspectionReport.exitCode}")
+                    append("\n  logExcerpt=${capture.logExcerpt ?: "<none>"}")
+                    append("\n  markerContent=${capture.markerContent ?: "<none>"}")
+                    append("\n  planContent=${capture.planContent ?: "<none>"}")
+                }
             }
         }.ifBlank { "- none" }
         val artifactLines = snapshot.stagedArtifacts.joinToString("\n") { artifact ->
@@ -177,6 +209,9 @@ class MainActivity : ComponentActivity() {
                 append("canAttemptMirrorSync=${report.canAttemptMirrorSync}, canAttemptInjection=${report.canAttemptInjection}")
             }
         } ?: "none"
+        val nativeBinaryReadinessLines = snapshot.injectionPreflightReport?.nativeBinaryReadiness
+            ?.joinToString("\n") { "- $it" }
+            ?.ifBlank { "- none" } ?: "- none"
         val blockingLines = snapshot.injectionPreflightReport?.blockingIssues?.joinToString("\n") { "- $it" }
             ?.ifBlank { "- none" } ?: "- none"
         val warningLines = snapshot.injectionPreflightReport?.warnings?.joinToString("\n") { "- $it" }
@@ -220,6 +255,10 @@ class MainActivity : ComponentActivity() {
             appendLine("integrity=$integrityText")
             appendLine("preflight=$preflightText")
             appendLine()
+            appendLine("Root Scripts")
+            appendLine("bundle=$scriptBundleText")
+            appendLine(scriptLines)
+            appendLine()
             appendLine("Staged Artifacts")
             appendLine(artifactLines)
             appendLine()
@@ -237,6 +276,11 @@ class MainActivity : ComponentActivity() {
             appendLine("wifi=$wifiText")
             appendLine("lastUpdatedAtMillis=${state.lastUpdatedAtMillis}")
             appendLine()
+            appendLine("Location Chain Probe")
+            appendLine(locationProbeText)
+            appendLine("resolvedLocation=$locationProbeResolved")
+            appendLine(locationProbeNotes)
+            appendLine()
             appendLine("Injection Plans")
             appendLine(planLines)
             appendLine()
@@ -245,6 +289,9 @@ class MainActivity : ComponentActivity() {
             appendLine()
             appendLine("Task Executions")
             appendLine(executionLines)
+            appendLine()
+            appendLine("Native Binary Readiness")
+            appendLine(nativeBinaryReadinessLines)
             appendLine()
             appendLine("Blocking Issues")
             appendLine(blockingLines)

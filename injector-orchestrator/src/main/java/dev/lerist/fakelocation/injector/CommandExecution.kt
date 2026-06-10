@@ -33,8 +33,43 @@ data class CommandExecutionReport(
 
 data class InjectionTaskExecution(
     val task: InjectionTask,
+    val mode: RootScriptMode,
+    val report: CommandExecutionReport,
+    val artifactCapture: ExecutionArtifactCapture? = null,
+)
+
+data class ExecutionArtifactCapture(
+    val inspectionReport: CommandExecutionReport,
+    val logExcerpt: String?,
+    val markerContent: String?,
+    val planContent: String?,
+)
+
+data class GeneratedRootScript(
+    val name: String,
+    val privateFile: File,
+    val sharedPathHint: String,
+    val purpose: String,
+    val targetProcess: String? = null,
+)
+
+data class RootScriptBundle(
+    val scriptRoot: File,
+    val sharedScriptRootHint: String,
+    val scripts: List<GeneratedRootScript>,
+    val generatedAtMillis: Long,
+)
+
+data class RootScriptExecution(
+    val script: GeneratedRootScript,
+    val mode: RootScriptMode,
     val report: CommandExecutionReport,
 )
+
+enum class RootScriptMode(val argument: String) {
+    DRY_RUN("dry-run"),
+    EXECUTE("execute"),
+}
 
 data class RuntimeMirrorSyncPlan(
     val mkdirCommands: List<String>,

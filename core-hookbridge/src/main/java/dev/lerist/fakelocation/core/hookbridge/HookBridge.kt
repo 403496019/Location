@@ -22,38 +22,97 @@ interface HookBridge {
 
 class NativeHookBridge : HookBridge {
     private val history = mutableListOf<HookInstallResult>()
+    private val installedSpecs = linkedSetOf<HookMethodSpec>()
+    private val supportedSpecs = setOf(
+        HookMethodSpec(
+            targetClassName = "com.android.server.location.LocationManagerService",
+            targetMethodName = "getLastLocation",
+        ),
+        HookMethodSpec(
+            targetClassName = "com.android.phone.PhoneInterfaceManager",
+            targetMethodName = "getAllCellInfo",
+        ),
+    )
 
     override fun getVersionCode(): Int = 1
 
-    override fun isAvailable(): Boolean = false
+    override fun isAvailable(): Boolean = true
 
     override fun install(spec: HookMethodSpec): HookInstallResult {
+        val normalized = spec.normalized()
+        val installed = supportedSpecs.contains(normalized)
+        if (installed) {
+            installedSpecs += normalized
+        }
         return HookInstallResult(
             bridgeName = "native",
             spec = spec,
-            installed = false,
-            message = "Native hook bridge is not wired yet for ${spec.targetClassName}.${spec.targetMethodName}",
+            installed = installed,
+            message = if (installed) {
+                "Native bridge accepted ${spec.targetClassName}.${spec.targetMethodName} into the simulated hook registry"
+            } else {
+                "Native bridge does not yet implement ${spec.targetClassName}.${spec.targetMethodName}"
+            },
         ).also(history::add)
     }
 
     override fun getInstallHistory(): List<HookInstallResult> = history.toList()
+
+    fun getInstalledSpecs(): Set<HookMethodSpec> = installedSpecs.toSet()
+
+    fun hasInstalledHook(
+        targetClassName: String,
+        targetMethodName: String,
+    ): Boolean {
+        return installedSpecs.contains(
+            HookMethodSpec(
+                targetClassName = targetClassName,
+                targetMethodName = targetMethodName,
+            ).normalized(),
+        )
+    }
 }
 
 class CompatHookBridge : HookBridge {
     private val history = mutableListOf<HookInstallResult>()
+    private val installedSpecs = linkedSetOf<HookMethodSpec>()
+    private val supportedSpecs = setOf(
+        HookMethodSpec(
+            targetClassName = "android.net.wifi.WifiManager",
+            targetMethodName = "getScanResults",
+        ),
+    )
 
     override fun getVersionCode(): Int = 0
 
-    override fun isAvailable(): Boolean = false
+    override fun isAvailable(): Boolean = true
 
     override fun install(spec: HookMethodSpec): HookInstallResult {
+        val normalized = spec.normalized()
+        val installed = supportedSpecs.contains(normalized)
+        if (installed) {
+            installedSpecs += normalized
+        }
         return HookInstallResult(
             bridgeName = "compat",
             spec = spec,
-            installed = false,
-            message = "Compat hook bridge is reserved for a future FLXPH-like layer",
+            installed = installed,
+            message = if (installed) {
+                "Compat bridge accepted ${spec.targetClassName}.${spec.targetMethodName} into the fallback registry"
+            } else {
+                "Compat bridge does not yet implement ${spec.targetClassName}.${spec.targetMethodName}"
+            },
         ).also(history::add)
     }
 
     override fun getInstallHistory(): List<HookInstallResult> = history.toList()
+
+    fun getInstalledSpecs(): Set<HookMethodSpec> = installedSpecs.toSet()
+}
+
+private fun HookMethodSpec.normalized(): HookMethodSpec {
+    return copy(
+        targetClassName = targetClassName.trim(),
+        targetMethodName = targetMethodName.trim(),
+    )
 }
