@@ -1,5 +1,8 @@
 package dev.lerist.fakelocation.core.hookbridge
 
+/**
+ * Specifies a target method for hook installation.
+ */
 data class HookMethodSpec(
     val targetClassName: String,
     val targetMethodName: String,
@@ -20,9 +23,22 @@ interface HookBridge {
     fun getInstallHistory(): List<HookInstallResult>
 }
 
+/**
+ * Native hook bridge.
+ *
+ * In the main app process this maintains a registry for panel
+ * observability.  The real ART-level hook installation happens inside the
+ * target process (system_server / com.android.phone) when liblh64.so is
+ * loaded by the injected loader — NOT in the main APK process.
+ *
+ * The {@code nativeLoaded} flag indicates whether lh64.so happens to be
+ * loaded in *this* process (e.g. for testing).  It does NOT represent
+ * whether the remote target process has hooks active.
+ */
 class NativeHookBridge : HookBridge {
     private val history = mutableListOf<HookInstallResult>()
     private val installedSpecs = linkedSetOf<HookMethodSpec>()
+
     private val supportedSpecs = setOf(
         HookMethodSpec(
             targetClassName = "com.android.server.location.LocationManagerService",
@@ -34,7 +50,17 @@ class NativeHookBridge : HookBridge {
         ),
     )
 
-    override fun getVersionCode(): Int = 1
+    /**
+     * Whether liblh64.so is loaded in *this* process.
+     * This is almost always false in the main APK process because
+     * liblh64 is deployed to /data/fl/native/ for remote dlopen,
+     * not installed as a conventional JNI library.
+     * Do NOT use this to judge whether remote injection succeeded.
+     */
+    var nativeLoaded: Boolean = false
+        private set
+
+    override fun getVersionCode(): Int = if (nativeLoaded) 6 else 1
 
     override fun isAvailable(): Boolean = true
 
@@ -49,7 +75,8 @@ class NativeHookBridge : HookBridge {
             spec = spec,
             installed = installed,
             message = if (installed) {
-                "Native bridge accepted ${spec.targetClassName}.${spec.targetMethodName} into the simulated hook registry"
+                "Native bridge accepted ${spec.targetClassName}.${spec.targetMethodName} into the " +
+                    "${if (nativeLoaded) "native" else "simulated"} registry"
             } else {
                 "Native bridge does not yet implement ${spec.targetClassName}.${spec.targetMethodName}"
             },

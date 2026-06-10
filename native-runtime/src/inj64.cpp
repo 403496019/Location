@@ -10,12 +10,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <unistd.h>
 
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -411,32 +414,256 @@ RemoteBlobPreview preview_blob_hex(
     return preview;
 }
 
-RegisterSnapshot capture_register_snapshot(int pid) {
-    RegisterSnapshot snapshot;
-#if defined(__aarch64__)
-    struct user_pt_regs {
-        unsigned long long regs[31];
-        unsigned long long sp;
-        unsigned long long pc;
-        unsigned long long pstate;
-    } regs = {};
-    struct iovec io = {
-        .iov_base = &regs,
-        .iov_len = sizeof(regs),
-    };
-    if (ptrace(PTRACE_GETREGSET, pid, reinterpret_cast<void*>(NT_PRSTATUS), &io) == 0) {
-        snapshot.available = true;
-        snapshot.pc = regs.pc;
-        snapshot.sp = regs.sp;
-        snapshot.lr = regs.regs[30];
-        snapshot.detail = "aarch64 register snapshot ok";
-    } else {
-        snapshot.detail = std::string("PTRACE_GETREGSET errno=") + std::to_string(errno);
+// ── aarch64 full register structure (shared across all remote ops) ──
+struct aarch64_user_regs {
+    unsigned long long regs[31];  // x0–x30
+    unsigned long long sp;
+    unsigned long long pc;
+    unsigned long long pstate;
+};
+
+bool aarch64_save_regs(int pid, aarch64_user_regs* out) {
+    if (out == nullptr) return false;
+    memset(out, 0, sizeof(*out));
+    struct iovec io = { .iov_base = out, .iov_len = sizeof(*out) };
+    return ptrace(PTRACE_GETREGSET, pid, reinterpret_cast<void*>(NT_PRSTATUS), &io) == 0;
+}
+
+bool aarch64_restore_regs(int pid, const aarch64_user_regs* regs) {
+    if (regs == nullptr) return false;
+    struct iovec io = { .iov_base = const_cast<aarch64_user_regs*>(regs), .iov_len = sizeof(*regs) };
+    return ptrace(PTRACE_SETREGSET, pid, reinterpret_cast<void*>(NT_PRSTATUS), &io) == 0;
+}
+
+// Set up registers for a remote function call.  LR is set to 0 so the
+// function will SIGSEGV on return — we catch that in remote_call_and_wait.
+bool aarch64_set_call_regs(
+    int pid, const aarch64_user_regs* base,
+    uintptr_t fn,
+    uintptr_t x0, uintptr_t x1, uintptr_t x2, uintptr_t x3,
+    uintptr_t x4, uintptr_t x5, uintptr_t x6, uintptr_t x7)
+{
+    aarch64_user_regs call_regs = *base;
+    call_regs.regs[0]  = x0;
+    call_regs.regs[1]  = x1;
+    call_regs.regs[2]  = x2;
+    call_regs.regs[3]  = x3;
+    call_regs.regs[4]  = x4;
+    call_regs.regs[5]  = x5;
+    call_regs.regs[6]  = x6;
+    call_regs.regs[7]  = x7;
+    call_regs.pc        = fn;
+    call_regs.regs[30]  = 0;   // LR = 0  →  crash on return
+    // Make room for callee stack usage (shrink SP by one page).
+    if (call_regs.sp > 4096) {
+        call_regs.sp -= 4096;
     }
-#else
-    snapshot.detail = "register snapshot unavailable on non-aarch64 build";
-#endif
-    return snapshot;
+    return aarch64_restore_regs(pid, &call_regs);
+}
+
+// PTRACE_CONT with signal 0 (suppress pending signal), then wait for the
+// tracee to stop again (it will SIGSEGV when the function returns to 0).
+// After that, read x0 and restore the saved base registers.
+// Returns the value of x0 on success; (uintptr_t)-1 on failure.
+uintptr_t aarch64_remote_call_and_wait(
+    int pid, const aarch64_user_regs* base, const char* log_path)
+{
+    // Continue, suppressing the pending signal (SIGSTOP or previous crash).
+    if (ptrace(PTRACE_CONT, pid, nullptr, reinterpret_cast<void*>(0)) != 0) {
+        write_log_line(log_path, "remote_call: PTRACE_CONT errno=%d", errno);
+        return static_cast<uintptr_t>(-1);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        write_log_line(log_path, "remote_call: waitpid errno=%d", errno);
+        return static_cast<uintptr_t>(-1);
+    }
+
+    // Read x0 from the stopped state.
+    aarch64_user_regs ret_regs = {};
+    uintptr_t result = static_cast<uintptr_t>(-1);
+    if (aarch64_save_regs(pid, &ret_regs)) {
+        result = static_cast<uintptr_t>(ret_regs.regs[0]);
+    }
+
+    int stop_sig = WIFSTOPPED(status) ? WSTOPSIG(status) : 0;
+    write_log_line(log_path, "remote_call: stopped sig=%d x0=0x%" PRIxPTR, stop_sig, result);
+
+    // Restore original registers so the tracee is ready for the next call.
+    aarch64_restore_regs(pid, base);
+    return result;
+}
+
+// ── remote memory access via /proc/<pid>/mem (requires ptrace-attach) ──
+
+ssize_t remote_mem_write(int pid, uintptr_t addr, const void* data, size_t len) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/mem", pid);
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return -1;
+    off_t off = lseek(fd, static_cast<off_t>(addr), SEEK_SET);
+    if (off < 0) { close(fd); return -1; }
+    ssize_t wrote = write(fd, data, len);
+    close(fd);
+    return wrote;
+}
+
+ssize_t remote_mem_read(int pid, uintptr_t addr, void* buf, size_t len) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/mem", pid);
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return -1;
+    off_t off = lseek(fd, static_cast<off_t>(addr), SEEK_SET);
+    if (off < 0) { close(fd); return -1; }
+    ssize_t n = read(fd, buf, len);
+    close(fd);
+    return n;
+}
+
+// ── full remote-injection orchestration ──
+// Executes:  mmap → write params → dlopen(loader) → dlsym(fl_loader_entry)
+//            → call entry(request, result) → read result
+// Returns true if the entire chain executed; out_result holds the loader's output.
+
+bool execute_remote_injection(
+    int pid,
+    const aarch64_user_regs* saved_regs,
+    const FlRuntimeRequest& request,
+    const RemoteSymbolPlan& dlopen_plan,
+    const RemoteSymbolPlan& dlsym_plan,
+    const RemoteSymbolPlan& mmap_plan,
+    const RemoteArgumentLayout& args_layout,
+    const RemoteTransactionLayout& tx_layout,
+    const std::vector<unsigned char>& string_block,
+    FlRuntimeResult* out_result,
+    const char* log_path)
+{
+    if (!dlopen_plan.resolved || !dlsym_plan.resolved || !mmap_plan.resolved) {
+        write_log_line(log_path, "remote_inject: unresolved symbols — abort");
+        return false;
+    }
+
+    // Step 1 — remote mmap(NULL, size, PROT_READ|PROT_WRITE|PROT_EXEC,
+    //                      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+    const uintptr_t prot = PROT_READ | PROT_WRITE | PROT_EXEC;   // 7
+    const uintptr_t flags = MAP_PRIVATE | MAP_ANONYMOUS;         // 0x22
+    aarch64_set_call_regs(pid, saved_regs, mmap_plan.remoteSymbol,
+        0, tx_layout.totalSizeAligned, prot, flags,
+        static_cast<uintptr_t>(-1), 0, 0, 0);
+    uintptr_t remote_block = aarch64_remote_call_and_wait(pid, saved_regs, log_path);
+    if (remote_block == static_cast<uintptr_t>(-1) || remote_block == 0) {
+        write_log_line(log_path, "remote_inject: mmap failed block=0x%" PRIxPTR, remote_block);
+        return false;
+    }
+    write_log_line(log_path, "remote_inject: mmap ok block=0x%" PRIxPTR " size=%zu",
+        remote_block, tx_layout.totalSizeAligned);
+
+    // Step 2 — build the complete remote transaction blob and write it
+    std::vector<unsigned char> blob(tx_layout.totalSizeAligned, 0);
+    // Copy string block
+    memcpy(blob.data() + tx_layout.stringBlockOffset,
+        string_block.data(), string_block.size());
+    // Build request struct with pointers rebased into remote block
+    FlRuntimeRequest remote_req = request;
+    remote_req.loader_path      = nullptr;  // will be patched below
+    remote_req.hook_bridge_path = nullptr;
+    remote_req.payload_path     = nullptr;
+    remote_req.hook_seed_path   = nullptr;
+    remote_req.entrypoint       = nullptr;
+    remote_req.log_path         = nullptr;
+    remote_req.plan_path        = nullptr;
+    // Patch string pointers to offsets inside remote_block
+    // (the loader reads strings from the string block, not through the request struct,
+    //  so we leave them as nullptr — the loader's fl_loader_entry has the actual paths
+    //  already baked into the string block.  We only need the request for the result.)
+    // Actually, the loader uses request fields directly.  We need to point them into
+    // the remote string block.
+    remote_req.loader_path      = reinterpret_cast<const char*>(remote_block + args_layout.loaderPathOffset);
+    remote_req.hook_bridge_path = reinterpret_cast<const char*>(remote_block + args_layout.hookBridgePathOffset);
+    remote_req.payload_path     = reinterpret_cast<const char*>(remote_block + args_layout.payloadPathOffset);
+    remote_req.hook_seed_path   = reinterpret_cast<const char*>(remote_block + args_layout.hookSeedPathOffset);
+    remote_req.entrypoint       = reinterpret_cast<const char*>(remote_block + args_layout.entrypointOffset);
+    // log_path and plan_path point to static paths — write them into the string block too
+    // (they are small fixed strings)
+
+    memcpy(blob.data() + tx_layout.requestBlockOffset, &remote_req, sizeof(remote_req));
+    // Zero-initialize the result block
+    memset(blob.data() + tx_layout.resultBlockOffset, 0, tx_layout.resultBlockSize);
+
+    ssize_t wrote = remote_mem_write(pid, remote_block, blob.data(), blob.size());
+    if (wrote != static_cast<ssize_t>(blob.size())) {
+        write_log_line(log_path, "remote_inject: write failed wrote=%zd expected=%zu errno=%d",
+            wrote, blob.size(), errno);
+        return false;
+    }
+    write_log_line(log_path, "remote_inject: wrote %zd bytes to block=0x%" PRIxPTR, wrote, remote_block);
+
+    // Step 3 — remote dlopen(loader_path, RTLD_NOW)
+    const uintptr_t rmt_loader_path = remote_block + args_layout.loaderPathOffset;
+    aarch64_set_call_regs(pid, saved_regs, dlopen_plan.remoteSymbol,
+        rmt_loader_path, RTLD_NOW, 0, 0, 0, 0, 0, 0);
+    uintptr_t loader_handle = aarch64_remote_call_and_wait(pid, saved_regs, log_path);
+    if (loader_handle == static_cast<uintptr_t>(-1) || loader_handle == 0) {
+        write_log_line(log_path, "remote_inject: dlopen failed handle=0x%" PRIxPTR, loader_handle);
+        return false;
+    }
+    write_log_line(log_path, "remote_inject: dlopen ok handle=0x%" PRIxPTR, loader_handle);
+
+    // Step 4 — write "fl_loader_entry\0" string into remote block for dlsym
+    const char* entry_sym = "fl_loader_entry";
+    // Place the symbol name right after the string block in our blob (temporary area)
+    const size_t sym_name_offset = tx_layout.requestBlockOffset + tx_layout.requestBlockSize;
+    if (sym_name_offset + strlen(entry_sym) + 1 <= blob.size()) {
+        memcpy(blob.data() + sym_name_offset, entry_sym, strlen(entry_sym) + 1);
+        wrote = remote_mem_write(pid, remote_block + sym_name_offset,
+            blob.data() + sym_name_offset, strlen(entry_sym) + 1);
+        if (wrote != static_cast<ssize_t>(strlen(entry_sym) + 1)) {
+            write_log_line(log_path, "remote_inject: write sym name failed");
+            return false;
+        }
+    }
+
+    // Step 5 — remote dlsym(handle, "fl_loader_entry")
+    aarch64_set_call_regs(pid, saved_regs, dlsym_plan.remoteSymbol,
+        loader_handle, remote_block + sym_name_offset, 0, 0, 0, 0, 0, 0);
+    uintptr_t entry_fn = aarch64_remote_call_and_wait(pid, saved_regs, log_path);
+    if (entry_fn == static_cast<uintptr_t>(-1) || entry_fn == 0) {
+        write_log_line(log_path, "remote_inject: dlsym failed fn=0x%" PRIxPTR, entry_fn);
+        return false;
+    }
+    write_log_line(log_path, "remote_inject: dlsym ok fn=0x%" PRIxPTR, entry_fn);
+
+    // Step 6 — remote call fl_loader_entry(request_ptr, result_ptr)
+    const uintptr_t rmt_req_ptr  = remote_block + tx_layout.requestBlockOffset;
+    const uintptr_t rmt_res_ptr  = remote_block + tx_layout.resultBlockOffset;
+    aarch64_set_call_regs(pid, saved_regs, entry_fn,
+        rmt_req_ptr, rmt_res_ptr, 0, 0, 0, 0, 0, 0);
+    uintptr_t entry_rc = aarch64_remote_call_and_wait(pid, saved_regs, log_path);
+    write_log_line(log_path, "remote_inject: entry returned x0=%" PRIdPTR, static_cast<intptr_t>(entry_rc));
+
+    // Step 7 — read result block back
+    FlRuntimeResult remote_result = {};
+    ssize_t nr = remote_mem_read(pid, remote_block + tx_layout.resultBlockOffset,
+        &remote_result, sizeof(remote_result));
+    if (nr == sizeof(remote_result) && out_result != nullptr) {
+        *out_result = remote_result;
+    }
+    write_log_line(log_path, "remote_inject: result code=%d msg=%s",
+        remote_result.code, remote_result.message);
+
+    return true;
+}
+
+// ── convenience: capture register snapshot from saved regs ──
+RegisterSnapshot snapshot_from_saved_regs(const aarch64_user_regs& regs, bool available) {
+    RegisterSnapshot s;
+    s.available = available;
+    s.pc = regs.pc;
+    s.sp = regs.sp;
+    s.lr = regs.regs[30];
+    s.detail = available ? "aarch64 register snapshot ok" : "aarch64 regs unavailable";
+    return s;
 }
 
 RemoteSymbolPlan resolve_remote_symbol_from_local(
@@ -766,21 +993,38 @@ int main(int argc, char** argv) {
     RemoteTransactionLayout remote_tx = build_remote_transaction_layout(request, remote_args);
     std::vector<unsigned char> remote_blob = build_remote_string_block(request, remote_args);
     RemoteBlobPreview remote_blob_preview = preview_blob_hex(remote_blob, 128);
+
+    // ── ptrace: probe, then stay attached for remote execution ──
+    bool remote_possible = false;
+    aarch64_user_regs saved_regs = {};
+    bool ptrace_attached = false;
+
     if (!parsed.dryRun) {
         ptrace_ok = attempt_ptrace_attach_probe(target_pid, parsed.logPath.c_str(), &ptrace_detail);
         print_and_log(parsed.logPath.c_str(), "phase=remote_attach_probe status=%s detail=%s",
             ptrace_ok ? "ok" : "warning",
             ptrace_detail.c_str());
+
         if (ptrace_ok) {
+            // Second attach — this time we stay attached for the real work.
             if (ptrace(PTRACE_ATTACH, target_pid, nullptr, nullptr) == 0) {
                 int status = 0;
                 if (waitpid(target_pid, &status, 0) >= 0) {
-                    register_snapshot = capture_register_snapshot(target_pid);
+                    ptrace_attached = true;
+                    bool regs_ok = aarch64_save_regs(target_pid, &saved_regs);
+                    register_snapshot = snapshot_from_saved_regs(saved_regs, regs_ok);
+                    print_and_log(parsed.logPath.c_str(),
+                        "phase=register_capture status=%s pc=0x%" PRIx64 " sp=0x%" PRIx64 " lr=0x%" PRIx64,
+                        regs_ok ? "ok" : "failed",
+                        register_snapshot.pc, register_snapshot.sp, register_snapshot.lr);
+                } else {
+                    register_snapshot.detail = std::string("waitpid errno=") + std::to_string(errno);
                 }
-                ptrace(PTRACE_DETACH, target_pid, nullptr, nullptr);
             } else {
                 register_snapshot.detail = std::string("second ptrace attach errno=") + std::to_string(errno);
             }
+
+            // Resolve remote symbols (need the process attached for /proc/pid/maps)
             remote_dlopen = resolve_remote_symbol_from_local(
                 remote_modules,
                 "dlopen",
@@ -796,8 +1040,11 @@ int main(int argc, char** argv) {
                 "mmap",
                 {"libc.so", "/libc.so"}
             );
-            print_and_log(parsed.logPath.c_str(), "phase=remote_symbol_plan status=%s detail=dlopen=0x%" PRIxPTR " dlsym=0x%" PRIxPTR " mmap=0x%" PRIxPTR,
-                (remote_dlopen.resolved && remote_dlsym.resolved && remote_mmap.resolved) ? "ok" : "warning",
+            remote_possible = remote_dlopen.resolved && remote_dlsym.resolved && remote_mmap.resolved;
+
+            print_and_log(parsed.logPath.c_str(),
+                "phase=remote_symbol_plan status=%s detail=dlopen=0x%" PRIxPTR " dlsym=0x%" PRIxPTR " mmap=0x%" PRIxPTR,
+                remote_possible ? "ok" : "warning",
                 remote_dlopen.remoteSymbol,
                 remote_dlsym.remoteSymbol,
                 remote_mmap.remoteSymbol);
@@ -805,6 +1052,8 @@ int main(int argc, char** argv) {
     } else {
         print_and_log(parsed.logPath.c_str(), "phase=remote_attach_probe status=ok detail=dry-run skipped ptrace");
     }
+
+    // ── always write the injection plan (useful for diagnostics) ──
     write_injection_plan(
         request,
         selinux,
@@ -825,6 +1074,7 @@ int main(int argc, char** argv) {
     print_and_log(parsed.logPath.c_str(), "phase=remote_plan status=ok detail=plan=%s",
         plan_path.c_str());
 
+    // ── local hook bridge ping (pre-flight validation) ──
     FlRuntimeResult hook_result = {};
     if (ping != nullptr) {
         int hook_code = ping(&request, &hook_result);
@@ -835,31 +1085,93 @@ int main(int argc, char** argv) {
         print_and_log(parsed.logPath.c_str(), "phase=hook_bridge_prepare status=warning detail=missing flh_ping");
     }
 
-    void* loader_handle = dlopen(parsed.loaderPath.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (loader_handle == nullptr) {
-        fprintf(stderr, "inj64: dlopen loader failed: %s\n", dlerror());
-        print_and_log(parsed.logPath.c_str(), "phase=payload_resolve status=failed detail=dlopen loader");
-        dlclose(hook_handle);
-        return 69;
-    }
-    FlLoaderEntryFn loader_entry =
-        reinterpret_cast<FlLoaderEntryFn>(dlsym(loader_handle, "fl_loader_entry"));
-    if (loader_entry == nullptr) {
-        fprintf(stderr, "inj64: missing fl_loader_entry symbol\n");
-        print_and_log(parsed.logPath.c_str(), "phase=payload_resolve status=failed detail=missing entry");
-        dlclose(loader_handle);
-        dlclose(hook_handle);
-        return 70;
-    }
-
-    print_and_log(parsed.logPath.c_str(), "phase=payload_resolve status=ok detail=payload=%s",
-        parsed.payloadPath.c_str());
+    // ── payload dispatch: remote injection (preferred) or local dlopen (fallback) ──
     FlRuntimeResult loader_result = {};
-    int loader_code = loader_entry(&request, &loader_result);
-    print_and_log(parsed.logPath.c_str(), "phase=entry_dispatch status=%s detail=%s",
-        loader_code == 0 ? "ok" : "failed",
-        loader_result.message[0] == '\0' ? "loader returned" : loader_result.message);
+    int loader_code = -1;
+    bool remote_executed = false;
 
+    if (ptrace_attached && remote_possible && !parsed.dryRun) {
+        print_and_log(parsed.logPath.c_str(),
+            "phase=remote_inject_start status=ok detail=target_pid=%d symbols=resolved", target_pid);
+
+        bool remote_ok = execute_remote_injection(
+            target_pid,
+            &saved_regs,
+            request,
+            remote_dlopen,
+            remote_dlsym,
+            remote_mmap,
+            remote_args,
+            remote_tx,
+            remote_blob,
+            &loader_result,
+            parsed.logPath.c_str()
+        );
+
+        if (remote_ok) {
+            remote_executed = true;
+            loader_code = loader_result.code;
+            print_and_log(parsed.logPath.c_str(),
+                "phase=entry_dispatch status=%s detail=remote code=%d msg=%s",
+                loader_code == 0 ? "ok" : "failed",
+                loader_code,
+                loader_result.message[0] == '\0' ? "remote loader returned" : loader_result.message);
+        } else {
+            print_and_log(parsed.logPath.c_str(),
+                "phase=remote_inject status=failed detail=remote execution chain failed; will attempt local fallback");
+        }
+    }
+
+    if (!remote_executed) {
+        // ── local fallback: dlopen loader in inj64's own process ──
+        void* loader_handle = dlopen(parsed.loaderPath.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (loader_handle == nullptr) {
+            fprintf(stderr, "inj64: dlopen loader failed: %s\n", dlerror());
+            print_and_log(parsed.logPath.c_str(), "phase=payload_resolve status=failed detail=dlopen loader");
+            if (ptrace_attached) {
+                aarch64_restore_regs(target_pid, &saved_regs);
+                ptrace(PTRACE_DETACH, target_pid, nullptr, nullptr);
+            }
+            dlclose(hook_handle);
+            return 69;
+        }
+        FlLoaderEntryFn loader_entry =
+            reinterpret_cast<FlLoaderEntryFn>(dlsym(loader_handle, "fl_loader_entry"));
+        if (loader_entry == nullptr) {
+            fprintf(stderr, "inj64: missing fl_loader_entry symbol\n");
+            print_and_log(parsed.logPath.c_str(), "phase=payload_resolve status=failed detail=missing entry");
+            dlclose(loader_handle);
+            if (ptrace_attached) {
+                aarch64_restore_regs(target_pid, &saved_regs);
+                ptrace(PTRACE_DETACH, target_pid, nullptr, nullptr);
+            }
+            dlclose(hook_handle);
+            return 70;
+        }
+        print_and_log(parsed.logPath.c_str(), "phase=payload_resolve status=ok detail=payload=%s (local fallback)",
+            parsed.payloadPath.c_str());
+        loader_code = loader_entry(&request, &loader_result);
+        print_and_log(parsed.logPath.c_str(), "phase=entry_dispatch status=%s detail=%s (local)",
+            loader_code == 0 ? "ok" : "failed",
+            loader_result.message[0] == '\0' ? "loader returned" : loader_result.message);
+        dlclose(loader_handle);
+    }
+
+    // ── cleanup: detach from target if we were attached ──
+    if (ptrace_attached) {
+        aarch64_restore_regs(target_pid, &saved_regs);
+        // PTRACE_DETACH with signal 0 suppresses any pending signal (SIGSEGV from LR=0).
+        long detach_rc = ptrace(PTRACE_DETACH, target_pid, nullptr, nullptr);
+        if (detach_rc != 0) {
+            write_log_line(parsed.logPath.c_str(), "ptrace_detach warning errno=%d", errno);
+        }
+        ptrace_attached = false;
+        print_and_log(parsed.logPath.c_str(), "phase=ptrace_detach status=%s",
+            detach_rc == 0 ? "ok" : "warning");
+    }
+    dlclose(hook_handle);
+
+    // ── write completion marker ──
     std::string safe = parsed.targetProcess;
     for (char& ch : safe) {
         if (ch == '.' || ch == ':') {
@@ -870,7 +1182,8 @@ int main(int argc, char** argv) {
     ensure_parent_dir(marker_path);
     FILE* marker = fopen(marker_path.c_str(), "w");
     if (marker != nullptr) {
-        fprintf(marker, "status=%s\n", loader_code == 0 ? "native_loader_invoked" : "native_loader_failed");
+        fprintf(marker, "status=%s\n",
+            loader_code == 0 ? (remote_executed ? "remote_loader_ok" : "local_loader_ok") : "loader_failed");
         fprintf(marker, "target_process=%s\n", parsed.targetProcess.c_str());
         fprintf(marker, "pid=%d\n", target_pid);
         fprintf(marker, "stage=%s\n", parsed.stage.c_str());
@@ -882,23 +1195,25 @@ int main(int argc, char** argv) {
         fprintf(marker, "hook_seed=%s\n", hook_seed_path.c_str());
         fprintf(marker, "plan_path=%s\n", plan_path.c_str());
         fprintf(marker, "ptrace_probe_ok=%s\n", ptrace_ok ? "true" : "false");
+        fprintf(marker, "remote_possible=%s\n", remote_possible ? "true" : "false");
+        fprintf(marker, "remote_executed=%s\n", remote_executed ? "true" : "false");
         fprintf(marker, "ptrace_probe_detail=%s\n", ptrace_detail.c_str());
         fprintf(marker, "loader_result_code=%d\n", loader_result.code);
         fprintf(marker, "loader_result_message=%s\n", loader_result.message);
         fclose(marker);
     }
-    print_and_log(parsed.logPath.c_str(), "phase=finalize status=%s detail=marker=%s",
+    print_and_log(parsed.logPath.c_str(), "phase=finalize status=%s detail=marker=%s remote=%s",
         loader_code == 0 ? "ok" : "failed",
-        marker_path.c_str());
-
-    dlclose(loader_handle);
-    dlclose(hook_handle);
+        marker_path.c_str(),
+        remote_executed ? "true" : "false");
 
     if (loader_code != 0) {
         fprintf(stderr, "inj64: loader failed: %s\n", loader_result.message);
         return loader_code;
     }
-    printf("inj64 execute ok target=%s pid=%d stage=%s log=%s marker=%s\n",
-        parsed.targetProcess.c_str(), target_pid, parsed.stage.c_str(), parsed.logPath.c_str(), marker_path.c_str());
+    printf("inj64 execute ok target=%s pid=%d stage=%s log=%s marker=%s remote=%s\n",
+        parsed.targetProcess.c_str(), target_pid, parsed.stage.c_str(),
+        parsed.logPath.c_str(), marker_path.c_str(),
+        remote_executed ? "true" : "false");
     return 0;
 }
