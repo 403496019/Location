@@ -1,6 +1,7 @@
 package dev.lerist.fakelocation.core.ipc
 
 import dev.lerist.fakelocation.core.model.MockLocation
+import dev.lerist.fakelocation.core.model.MockCellRecord
 import dev.lerist.fakelocation.core.model.MockSessionState
 import dev.lerist.fakelocation.core.model.MockWifiProfile
 import java.util.concurrent.CopyOnWriteArrayList
@@ -8,6 +9,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 object ServiceNames {
     const val MOCK_LOCATION = "service_fl_ml"
     const val MOCK_WIFI = "service_fl_mw"
+    const val MOCK_CELLS = "service_fl_mc"
     const val NATIVE_CATCH = "service_fl_na"
 }
 
@@ -24,8 +26,27 @@ interface MockWifiManager {
     fun updateWifi(profile: MockWifiProfile)
 }
 
+interface MockCellManager {
+    fun startMockCells()
+    fun stopMockCells()
+    fun updateCells(cells: List<MockCellRecord>)
+}
+
+data class NativeLocationSyncReport(
+    val success: Boolean,
+    val active: Boolean,
+    val backend: String,
+    val sharedPath: String?,
+    val detail: String,
+    val syncedAtMillis: Long,
+)
+
 interface NativeCatchManager {
     fun isHookEngineReady(): Boolean
+    fun pushMockState(state: MockSessionState): NativeLocationSyncReport
+    fun pushMockLocation(location: MockLocation): NativeLocationSyncReport
+    fun stopMockLocation(): NativeLocationSyncReport
+    fun getLastSyncReport(): NativeLocationSyncReport?
 }
 
 interface MockServiceProvider {
@@ -126,10 +147,77 @@ class InMemoryMockWifiManager(
     }
 }
 
+class InMemoryMockCellManager(
+    private val stateStore: InMemoryMockStateStore,
+) : MockCellManager {
+    override fun startMockCells() {
+        stateStore.update { state ->
+            state.copy(
+                toggles = state.toggles.copy(cellsEnabled = true),
+            )
+        }
+    }
+
+    override fun stopMockCells() {
+        stateStore.update { state ->
+            state.copy(
+                toggles = state.toggles.copy(cellsEnabled = false),
+            )
+        }
+    }
+
+    override fun updateCells(cells: List<MockCellRecord>) {
+        stateStore.update { state ->
+            state.copy(
+                toggles = state.toggles.copy(cellsEnabled = true),
+                currentCells = cells,
+            )
+        }
+    }
+}
+
 class InMemoryNativeCatchManager(
     private val hookReadyProvider: () -> Boolean,
 ) : NativeCatchManager {
     override fun isHookEngineReady(): Boolean = hookReadyProvider()
+
+    @Volatile
+    private var lastSyncReport: NativeLocationSyncReport? = null
+
+    override fun pushMockState(state: MockSessionState): NativeLocationSyncReport {
+        return NativeLocationSyncReport(
+            success = false,
+            active = state.toggles.locationEnabled || state.toggles.wifiEnabled || state.toggles.cellsEnabled,
+            backend = "in-memory",
+            sharedPath = null,
+            detail = "Native sync is not implemented for the in-memory catch manager",
+            syncedAtMillis = System.currentTimeMillis(),
+        ).also { lastSyncReport = it }
+    }
+
+    override fun pushMockLocation(location: MockLocation): NativeLocationSyncReport {
+        return NativeLocationSyncReport(
+            success = false,
+            active = true,
+            backend = "in-memory",
+            sharedPath = null,
+            detail = "Native sync is not implemented for the in-memory catch manager",
+            syncedAtMillis = System.currentTimeMillis(),
+        ).also { lastSyncReport = it }
+    }
+
+    override fun stopMockLocation(): NativeLocationSyncReport {
+        return NativeLocationSyncReport(
+            success = false,
+            active = false,
+            backend = "in-memory",
+            sharedPath = null,
+            detail = "Native sync is not implemented for the in-memory catch manager",
+            syncedAtMillis = System.currentTimeMillis(),
+        ).also { lastSyncReport = it }
+    }
+
+    override fun getLastSyncReport(): NativeLocationSyncReport? = lastSyncReport
 }
 
 class InMemoryMockServiceRegistry : MockServiceProvider {

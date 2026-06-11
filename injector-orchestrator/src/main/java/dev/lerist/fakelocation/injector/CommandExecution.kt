@@ -89,6 +89,7 @@ data class RuntimeMirrorSyncResult(
 class AndroidShellExecutor {
     fun probeEnvironment(): InjectorEnvironment {
         val suPath = findExecutable(
+            "/product/bin/su",
             "/system/bin/su",
             "/system/xbin/su",
             "/sbin/su",

@@ -5,7 +5,9 @@
 #include <dlfcn.h>
 #include <jni.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <sys/system_properties.h>
 
@@ -27,7 +29,31 @@ struct MockLocationData {
     int64_t timestamp_millis = 0;
 };
 
+struct MockWifiData {
+    bool active = false;
+    char ssid[128] = "";
+    char bssid[32] = "";
+    int frequency_mhz = 0;
+    int rssi_dbm = 0;
+};
+
+struct MockCellData {
+    int mcc = 0;
+    int mnc = 0;
+    int lac_or_tac = 0;
+    long long cid_or_nci = 0;
+};
+
+static constexpr int MAX_MOCK_CELLS = 8;
+
 static MockLocationData g_mock_location;
+static MockWifiData g_mock_wifi;
+static MockCellData g_mock_cells[MAX_MOCK_CELLS];
+static int g_mock_cell_count = 0;
+static bool g_wifi_active = false;
+static bool g_cells_active = false;
+static const char* k_mock_state_file = "/data/fl/metadata/mock-location-state.txt";
+static time_t g_mock_state_mtime = 0;
 
 // ═══════════════════════════════════════════════════════
 //  Runtime metadata
@@ -120,6 +146,322 @@ static jobject build_mock_location(JNIEnv* env) {
     return location;
 }
 
+static jobject new_array_list(JNIEnv* env) {
+    jclass arraylist = env->FindClass("java/util/ArrayList");
+    if (!arraylist || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+    jmethodID ctor = env->GetMethodID(arraylist, "<init>", "()V");
+    jmethodID add = env->GetMethodID(arraylist, "add", "(Ljava/lang/Object;)Z");
+    if (!ctor || !add || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+    jobject list = env->NewObject(arraylist, ctor);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+    return list;
+}
+
+static bool array_list_add(JNIEnv* env, jobject list, jobject value) {
+    if (!list || !value) return false;
+    jclass arraylist = env->FindClass("java/util/ArrayList");
+    if (!arraylist || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    jmethodID add = env->GetMethodID(arraylist, "add", "(Ljava/lang/Object;)Z");
+    if (!add || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    env->CallBooleanMethod(list, add, value);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    return true;
+}
+
+static bool set_object_field(JNIEnv* env, jobject obj, const char* name, const char* sig, jobject value) {
+    jclass cls = env->GetObjectClass(obj);
+    jfieldID field = env->GetFieldID(cls, name, sig);
+    if (!field || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    env->SetObjectField(obj, field, value);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    return true;
+}
+
+static bool set_int_field(JNIEnv* env, jobject obj, const char* name, jint value) {
+    jclass cls = env->GetObjectClass(obj);
+    jfieldID field = env->GetFieldID(cls, name, "I");
+    if (!field || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    env->SetIntField(obj, field, value);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    return true;
+}
+
+static bool set_long_field(JNIEnv* env, jobject obj, const char* name, jlong value) {
+    jclass cls = env->GetObjectClass(obj);
+    jfieldID field = env->GetFieldID(cls, name, "J");
+    if (!field || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    env->SetLongField(obj, field, value);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    return true;
+}
+
+static bool set_bool_field(JNIEnv* env, jobject obj, const char* name, jboolean value) {
+    jclass cls = env->GetObjectClass(obj);
+    jfieldID field = env->GetFieldID(cls, name, "Z");
+    if (!field || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    env->SetBooleanField(obj, field, value);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    return true;
+}
+
+static jobject build_mock_scan_result(JNIEnv* env) {
+    jclass scan_cls = env->FindClass("android/net/wifi/ScanResult");
+    if (!scan_cls || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+    jmethodID ctor = env->GetMethodID(scan_cls, "<init>", "()V");
+    if (!ctor || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+    jobject result = env->NewObject(scan_cls, ctor);
+    if (!result || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+
+    jstring ssid = env->NewStringUTF(g_mock_wifi.ssid);
+    jstring bssid = env->NewStringUTF(g_mock_wifi.bssid);
+    bool ok = false;
+    ok |= set_object_field(env, result, "SSID", "Ljava/lang/String;", ssid);
+    ok |= set_object_field(env, result, "wifiSsid", "Landroid/net/wifi/WifiSsid;", nullptr);
+    ok |= set_object_field(env, result, "BSSID", "Ljava/lang/String;", bssid);
+    ok |= set_int_field(env, result, "frequency", g_mock_wifi.frequency_mhz);
+    ok |= set_int_field(env, result, "level", g_mock_wifi.rssi_dbm);
+    ok |= set_long_field(env, result, "timestamp", static_cast<jlong>(g_mock_location.timestamp_millis));
+    env->ExceptionClear();
+    return ok ? result : nullptr;
+}
+
+static jobject build_mock_cell_info_lte(JNIEnv* env, const MockCellData& cell) {
+    jclass info_cls = env->FindClass("android/telephony/CellInfoLte");
+    jclass id_cls = env->FindClass("android/telephony/CellIdentityLte");
+    jclass ss_cls = env->FindClass("android/telephony/CellSignalStrengthLte");
+    if (!info_cls || !id_cls || !ss_cls || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+
+    jmethodID info_ctor = env->GetMethodID(info_cls, "<init>", "()V");
+    jmethodID id_ctor = env->GetMethodID(id_cls, "<init>", "()V");
+    jmethodID ss_ctor = env->GetMethodID(ss_cls, "<init>", "()V");
+    if (!info_ctor || !id_ctor || !ss_ctor || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+
+    jobject info = env->NewObject(info_cls, info_ctor);
+    jobject identity = env->NewObject(id_cls, id_ctor);
+    jobject signal = env->NewObject(ss_cls, ss_ctor);
+    if (!info || !identity || !signal || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+
+    bool ok = false;
+    ok |= set_int_field(env, identity, "mMcc", cell.mcc);
+    ok |= set_int_field(env, identity, "mMnc", cell.mnc);
+    ok |= set_int_field(env, identity, "mTac", cell.lac_or_tac);
+    ok |= set_int_field(env, identity, "mCi", static_cast<jint>(cell.cid_or_nci & 0x7fffffff));
+    ok |= set_int_field(env, signal, "mRsrp", -95);
+    ok |= set_int_field(env, signal, "mRsrq", -10);
+    ok |= set_int_field(env, signal, "mRssi", -70);
+    ok |= set_int_field(env, signal, "mSignalStrength", 25);
+    ok |= set_object_field(env, info, "mCellIdentityLte", "Landroid/telephony/CellIdentityLte;", identity);
+    ok |= set_object_field(env, info, "mCellSignalStrengthLte", "Landroid/telephony/CellSignalStrengthLte;", signal);
+    ok |= set_bool_field(env, info, "mRegistered", JNI_TRUE);
+    ok |= set_long_field(env, info, "mTimeStamp", static_cast<jlong>(g_mock_location.timestamp_millis));
+    env->ExceptionClear();
+    return ok ? info : nullptr;
+}
+
+static void trim_line_end(char* value) {
+    if (!value) return;
+    size_t len = strlen(value);
+    while (len > 0 && (value[len - 1] == '\n' || value[len - 1] == '\r' || value[len - 1] == ' ' || value[len - 1] == '\t')) {
+        value[len - 1] = '\0';
+        len--;
+    }
+}
+
+static void clear_mock_cells() {
+    g_mock_cell_count = 0;
+    memset(g_mock_cells, 0, sizeof(g_mock_cells));
+}
+
+static void parse_cells_payload(const char* value) {
+    clear_mock_cells();
+    if (!value || value[0] == '\0') {
+        return;
+    }
+
+    char buffer[512];
+    strncpy(buffer, value, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
+
+    char* save_outer = nullptr;
+    char* item = strtok_r(buffer, "|", &save_outer);
+    while (item && g_mock_cell_count < MAX_MOCK_CELLS) {
+        MockCellData parsed {};
+        char* save_inner = nullptr;
+        char* token = strtok_r(item, ",", &save_inner);
+        int index = 0;
+        while (token) {
+            switch (index) {
+                case 0: parsed.mcc = atoi(token); break;
+                case 1: parsed.mnc = atoi(token); break;
+                case 2: parsed.lac_or_tac = atoi(token); break;
+                case 3: parsed.cid_or_nci = atoll(token); break;
+                default: break;
+            }
+            token = strtok_r(nullptr, ",", &save_inner);
+            index++;
+        }
+        if (index >= 4) {
+            g_mock_cells[g_mock_cell_count++] = parsed;
+        }
+        item = strtok_r(nullptr, "|", &save_outer);
+    }
+}
+
+static void refresh_mock_location_from_shared_state() {
+    struct stat st {};
+    if (stat(k_mock_state_file, &st) != 0) {
+        return;
+    }
+    if (st.st_mtime == g_mock_state_mtime) {
+        return;
+    }
+
+    FILE* file = fopen(k_mock_state_file, "r");
+    if (!file) {
+        return;
+    }
+
+    MockLocationData next = g_mock_location;
+    MockWifiData next_wifi = g_mock_wifi;
+    bool next_cells_active = g_mock_cell_count > 0;
+    int primary_mcc = 0;
+    int primary_mnc = 0;
+    int primary_lac_or_tac = 0;
+    long long primary_cid_or_nci = 0;
+    bool saw_cells_payload = false;
+    char line[256];
+    while (fgets(line, sizeof(line), file)) {
+        trim_line_end(line);
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        const char* key = line;
+        const char* value = eq + 1;
+        if (strcmp(key, "active") == 0 || strcmp(key, "location_active") == 0) {
+            next.active = strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0;
+        } else if (strcmp(key, "latitude") == 0) {
+            next.latitude = strtod(value, nullptr);
+        } else if (strcmp(key, "longitude") == 0) {
+            next.longitude = strtod(value, nullptr);
+        } else if (strcmp(key, "altitude") == 0) {
+            next.altitude = strtod(value, nullptr);
+        } else if (strcmp(key, "accuracy") == 0) {
+            next.accuracy = strtof(value, nullptr);
+        } else if (strcmp(key, "provider") == 0) {
+            strncpy(next.provider, value, sizeof(next.provider) - 1);
+            next.provider[sizeof(next.provider) - 1] = '\0';
+        } else if (strcmp(key, "timestampMillis") == 0 ||
+                   strcmp(key, "location_timestamp_millis") == 0) {
+            next.timestamp_millis = strtoll(value, nullptr, 10);
+        } else if (strcmp(key, "wifi_active") == 0) {
+            next_wifi.active = strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0;
+        } else if (strcmp(key, "wifi_ssid") == 0) {
+            strncpy(next_wifi.ssid, value, sizeof(next_wifi.ssid) - 1);
+            next_wifi.ssid[sizeof(next_wifi.ssid) - 1] = '\0';
+        } else if (strcmp(key, "wifi_bssid") == 0) {
+            strncpy(next_wifi.bssid, value, sizeof(next_wifi.bssid) - 1);
+            next_wifi.bssid[sizeof(next_wifi.bssid) - 1] = '\0';
+        } else if (strcmp(key, "wifi_frequency_mhz") == 0) {
+            next_wifi.frequency_mhz = atoi(value);
+        } else if (strcmp(key, "wifi_rssi_dbm") == 0) {
+            next_wifi.rssi_dbm = atoi(value);
+        } else if (strcmp(key, "cells_active") == 0) {
+            next_cells_active = strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0;
+        } else if (strcmp(key, "cell_primary_mcc") == 0) {
+            primary_mcc = atoi(value);
+        } else if (strcmp(key, "cell_primary_mnc") == 0) {
+            primary_mnc = atoi(value);
+        } else if (strcmp(key, "cell_primary_lac_or_tac") == 0) {
+            primary_lac_or_tac = atoi(value);
+        } else if (strcmp(key, "cell_primary_cid_or_nci") == 0) {
+            primary_cid_or_nci = atoll(value);
+        } else if (strcmp(key, "cells_payload") == 0) {
+            parse_cells_payload(value);
+            saw_cells_payload = true;
+        }
+    }
+    fclose(file);
+
+    g_mock_location = next;
+    g_mock_wifi = next_wifi;
+    g_wifi_active = next_wifi.active;
+    if (!saw_cells_payload) {
+        clear_mock_cells();
+        if (primary_mcc != 0 || primary_mnc != 0 || primary_lac_or_tac != 0 || primary_cid_or_nci != 0) {
+            g_mock_cells[0].mcc = primary_mcc;
+            g_mock_cells[0].mnc = primary_mnc;
+            g_mock_cells[0].lac_or_tac = primary_lac_or_tac;
+            g_mock_cells[0].cid_or_nci = primary_cid_or_nci;
+            g_mock_cell_count = 1;
+        }
+    }
+    if (!next_cells_active) {
+        clear_mock_cells();
+    }
+    g_cells_active = next_cells_active && g_mock_cell_count > 0;
+    g_mock_state_mtime = st.st_mtime;
+}
+
 // ═══════════════════════════════════════════════════════
 //  Trampolines — called by ART as managed-code replacements
 //
@@ -133,6 +475,7 @@ static jobject build_mock_location(JNIEnv* env) {
 //   managed: x0 = this  →  x0 = Location*
 //   C:       void* fn(void* this)
 static void* trampoline_getLastLocation(void* receiver) {
+    refresh_mock_location_from_shared_state();
     if (!g_mock_location.active) {
         auto orig = reinterpret_cast<void*(*)(void*)>(g_orig_getLastLocation);
         if (orig) return orig(receiver);
@@ -149,6 +492,7 @@ static void* trampoline_getLastLocation(void* receiver) {
 static void* trampoline_getLastLocation_req(
     void* receiver, void* request, void* packageName)
 {
+    refresh_mock_location_from_shared_state();
     if (!g_mock_location.active) {
         auto orig = reinterpret_cast<void*(*)(void*,void*,void*)>(g_orig_getLastLocation_req);
         if (orig) return orig(receiver, request, packageName);
@@ -162,7 +506,8 @@ static void* trampoline_getLastLocation_req(
 
 // Trampoline: List<CellInfo> getAllCellInfo()
 static void* trampoline_getAllCellInfo(void* receiver) {
-    if (!g_mock_location.active) {
+    refresh_mock_location_from_shared_state();
+    if (!g_cells_active) {
         auto orig = reinterpret_cast<void*(*)(void*)>(g_orig_getAllCellInfo);
         if (orig) return orig(receiver);
         return nullptr;
@@ -179,7 +524,8 @@ static void* trampoline_getAllCellInfo(void* receiver) {
 
 // Trampoline: List<ScanResult> getScanResults()
 static void* trampoline_getScanResults(void* receiver) {
-    if (!g_mock_location.active) {
+    refresh_mock_location_from_shared_state();
+    if (!g_wifi_active) {
         auto orig = reinterpret_cast<void*(*)(void*)>(g_orig_getScanResults);
         if (orig) return orig(receiver);
         return nullptr;
@@ -192,6 +538,47 @@ static void* trampoline_getScanResults(void* receiver) {
     jobject empty_list = env->NewObject(arraylist, ctor);
     env->ExceptionClear();
     return empty_list;
+}
+
+static void* trampoline_getAllCellInfo_v2(void* receiver) {
+    refresh_mock_location_from_shared_state();
+    if (g_mock_cell_count <= 0) {
+        auto orig = reinterpret_cast<void*(*)(void*)>(g_orig_getAllCellInfo);
+        if (orig) return orig(receiver);
+        return nullptr;
+    }
+    JNIEnv* env = get_env_for_trampoline();
+    if (!env) return nullptr;
+    LOGI("TRAMP getAllCellInfo v2 mock active count=%d", g_mock_cell_count);
+    jobject list = new_array_list(env);
+    if (!list) return nullptr;
+    for (int i = 0; i < g_mock_cell_count; ++i) {
+        jobject item = build_mock_cell_info_lte(env, g_mock_cells[i]);
+        if (item) {
+            array_list_add(env, list, item);
+        }
+    }
+    return list;
+}
+
+static void* trampoline_getScanResults_v2(void* receiver) {
+    refresh_mock_location_from_shared_state();
+    if (!g_mock_wifi.active) {
+        auto orig = reinterpret_cast<void*(*)(void*)>(g_orig_getScanResults);
+        if (orig) return orig(receiver);
+        return nullptr;
+    }
+    JNIEnv* env = get_env_for_trampoline();
+    if (!env) return nullptr;
+    LOGI("TRAMP getScanResults v2 mock active ssid=%s bssid=%s",
+        g_mock_wifi.ssid, g_mock_wifi.bssid);
+    jobject list = new_array_list(env);
+    if (!list) return nullptr;
+    jobject item = build_mock_scan_result(env);
+    if (item) {
+        array_list_add(env, list, item);
+    }
+    return list;
 }
 
 // ═══════════════════════════════════════════════════════
@@ -569,14 +956,14 @@ extern "C" int flh_install_hooks(const char* stage, const char* log_path) {
             "com/android/phone/PhoneInterfaceManager",
             "getAllCellInfo",
             "()Ljava/util/List;",
-            (void*)trampoline_getAllCellInfo
+            (void*)trampoline_getAllCellInfo_v2
         }, log_path)) installed++;
 
         if (install_art_hook(env, {
             "android/net/wifi/WifiManager",
             "getScanResults",
             "()Ljava/util/List;",
-            (void*)trampoline_getScanResults
+            (void*)trampoline_getScanResults_v2
         }, log_path)) installed++;
     }
 
@@ -604,6 +991,8 @@ extern "C" void flh_update_mock_location(
     float acc, const char* provider, int64_t timestamp_ms)
 {
     g_mock_location.active = true;
+    g_wifi_active = false;
+    g_cells_active = false;
     g_mock_location.latitude = lat;
     g_mock_location.longitude = lon;
     g_mock_location.altitude = alt;
@@ -615,8 +1004,12 @@ extern "C" void flh_update_mock_location(
 
 extern "C" void flh_stop_mock_location() {
     g_mock_location.active = false;
+    g_wifi_active = false;
+    g_cells_active = false;
     LOGI("Mock location stopped");
 }
 
 extern "C" int flh_get_hook_count() { return g_hook_count; }
-extern "C" int flh_is_mock_active(void) { return g_mock_location.active ? 1 : 0; }
+extern "C" int flh_is_mock_active(void) {
+    return (g_mock_location.active || g_wifi_active || g_cells_active) ? 1 : 0;
+}

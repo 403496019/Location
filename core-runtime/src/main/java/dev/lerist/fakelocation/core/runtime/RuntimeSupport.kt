@@ -2,6 +2,9 @@ package dev.lerist.fakelocation.core.runtime
 
 import android.content.Context
 import android.os.Build
+import dev.lerist.fakelocation.core.model.MockCellRecord
+import dev.lerist.fakelocation.core.model.MockSessionState
+import dev.lerist.fakelocation.core.model.MockWifiProfile
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -103,6 +106,10 @@ class RuntimeAssetManager(private val context: Context) {
 
     fun sharedRuntimeRoot(): File = File("/data/fl")
 
+    fun privateMetadataFile(name: String): File = File(privateRuntimeRoot(), "staged/fl/metadata/$name")
+
+    fun sharedMetadataFile(name: String): File = File(sharedRuntimeRoot(), "metadata/$name")
+
     fun getLastPreparationReport(): RuntimePreparationReport? = lastReport
 
     fun prepareRuntimeLayout(): RuntimePreparationReport {
@@ -130,7 +137,7 @@ class RuntimeAssetManager(private val context: Context) {
         val report = RuntimePreparationReport(
             layout = layout,
             artifacts = artifacts,
-            manifestVersion = "phase1-runtime-v4",
+            manifestVersion = "phase1-runtime-v5",
             generatedAtMillis = System.currentTimeMillis(),
         )
         layout.manifestFile.writeText(buildManifest(report))
@@ -143,6 +150,7 @@ class RuntimeAssetManager(private val context: Context) {
     ): RuntimeIntegrityReport {
         val artifactReports = report.artifacts.map { artifact ->
             val file = artifact.privateFile
+            val mutableAtRuntime = isRuntimeMutableArtifact(artifact.descriptor.logicalName)
             when {
                 !file.exists() -> ArtifactIntegrityReport(
                     logicalName = artifact.descriptor.logicalName,
@@ -164,7 +172,7 @@ class RuntimeAssetManager(private val context: Context) {
                     actualSha256 = sha256Of(file),
                     isPlaceholder = artifact.isPlaceholder,
                 )
-                sha256Of(file) != artifact.sha256 -> ArtifactIntegrityReport(
+                !mutableAtRuntime && sha256Of(file) != artifact.sha256 -> ArtifactIntegrityReport(
                     logicalName = artifact.descriptor.logicalName,
                     status = ArtifactIntegrityStatus.HASH_MISMATCH,
                     filePath = file.absolutePath,
@@ -181,7 +189,7 @@ class RuntimeAssetManager(private val context: Context) {
                     expectedSizeBytes = artifact.sizeBytes,
                     actualSizeBytes = file.length(),
                     expectedSha256 = artifact.sha256,
-                    actualSha256 = artifact.sha256,
+                    actualSha256 = sha256Of(file),
                     isPlaceholder = artifact.isPlaceholder,
                 )
             }
@@ -207,7 +215,7 @@ class RuntimeAssetManager(private val context: Context) {
         val scriptsRoot = File(stagedRoot, "scripts")
         val metadataRoot = File(stagedRoot, "metadata")
         val logsRoot = File(privateRoot, "logs")
-        val manifestFile = File(metadataRoot, "runtime-manifest-v4.txt")
+        val manifestFile = File(metadataRoot, "runtime-manifest-v5.txt")
         RuntimeLayoutSnapshot(
             privateRoot = privateRoot,
             stagedRoot = stagedRoot,
@@ -290,6 +298,13 @@ class RuntimeAssetManager(private val context: Context) {
                 versionTag = "phase1-demo",
                 sourceTag = "payload-bridge-seed",
             ),
+            RuntimeAssetDescriptor(
+                logicalName = "mock_location_state",
+                relativePath = "metadata/mock-location-state.txt",
+                kind = RuntimeArtifactKind.METADATA,
+                versionTag = "phase1-shared-state-v1",
+                sourceTag = "control-plane-shared-metadata",
+            ),
         )
     }
 
@@ -322,6 +337,11 @@ class RuntimeAssetManager(private val context: Context) {
         if (descriptor.logicalName == "hook_registry_seed") {
             return buildHookRegistrySeedContent()
         }
+        if (descriptor.logicalName == "mock_location_state") {
+            return buildMockStateContent(
+                MockSessionState(),
+            )
+        }
         return buildPlaceholderContent(descriptor)
     }
 
@@ -333,6 +353,46 @@ class RuntimeAssetManager(private val context: Context) {
             appendLine("process=app stage=compat hook=android.net.wifi.WifiManager#getScanResults")
             appendLine("note=seed file consumed by native hook bridge and loader stubs")
             appendLine("generatedAtMillis=${System.currentTimeMillis()}")
+        }
+    }
+
+    fun buildMockStateContent(state: MockSessionState): String {
+        val location = state.currentLocation
+        val wifi = state.currentWifiProfile
+        val primaryCell = state.currentCells.firstOrNull()
+        return buildString {
+            appendLine("version=phase1-mock-state-v1")
+            appendLine("location_active=${if (state.toggles.locationEnabled && location != null) 1 else 0}")
+            appendLine("latitude=${location?.latitude ?: 31.2304}")
+            appendLine("longitude=${location?.longitude ?: 121.4737}")
+            appendLine("altitude=${location?.altitudeMeters ?: 12.0}")
+            appendLine("accuracy=${location?.accuracyMeters ?: 8f}")
+            appendLine("provider=${location?.provider ?: "gps"}")
+            appendLine("location_timestamp_millis=${state.lastUpdatedAtMillis}")
+            appendLine("wifi_active=${if (state.toggles.wifiEnabled && wifi != null) 1 else 0}")
+            appendLine("wifi_ssid=${wifi?.ssid ?: ""}")
+            appendLine("wifi_bssid=${wifi?.bssid ?: ""}")
+            appendLine("wifi_frequency_mhz=${wifi?.frequencyMhz ?: 0}")
+            appendLine("wifi_rssi_dbm=${wifi?.rssiDbm ?: 0}")
+            appendLine("cells_active=${if (state.toggles.cellsEnabled && state.currentCells.isNotEmpty()) 1 else 0}")
+            appendLine("cells_count=${state.currentCells.size}")
+            appendLine("cell_primary_mcc=${primaryCell?.mcc ?: 0}")
+            appendLine("cell_primary_mnc=${primaryCell?.mnc ?: 0}")
+            appendLine("cell_primary_lac_or_tac=${primaryCell?.lacOrTac ?: 0}")
+            appendLine("cell_primary_cid_or_nci=${primaryCell?.cidOrNci ?: 0L}")
+            appendLine("cells_payload=${encodeCells(state.currentCells)}")
+            appendLine("updatedAtMillis=${System.currentTimeMillis()}")
+        }
+    }
+
+    private fun encodeCells(cells: List<MockCellRecord>): String {
+        return cells.joinToString("|") { cell ->
+            listOf(
+                cell.mcc,
+                cell.mnc,
+                cell.lacOrTac,
+                cell.cidOrNci,
+            ).joinToString(",")
         }
     }
 
@@ -555,6 +615,10 @@ class RuntimeAssetManager(private val context: Context) {
                 appendLine()
             }
         }
+    }
+
+    private fun isRuntimeMutableArtifact(logicalName: String): Boolean {
+        return logicalName == "mock_location_state"
     }
 
     private fun sha256Of(file: File): String {

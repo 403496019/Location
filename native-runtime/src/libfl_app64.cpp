@@ -12,6 +12,43 @@
 
 namespace {
 
+constexpr const char* kPayloadEntryClassNameUtf8 = "\xE0\xA2\xA1.\xE0\xA2\xA1";
+constexpr const char* kPayloadEntryClassDescriptorLog = "L\\u08a1/\\u08a1;";
+
+bool ensure_mock_state_visible(const FlRuntimeRequest* request, const char* log_path) {
+    const char* payload_path = (request && request->payload_path) ? request->payload_path : "";
+    char mock_state_path[512] = "/data/fl/metadata/mock-location-state.txt";
+    const char* payload_marker = strstr(payload_path, "/payload/");
+    if (payload_marker != nullptr) {
+        size_t prefix_len = static_cast<size_t>(payload_marker - payload_path);
+        const char* suffix = "/metadata/mock-location-state.txt";
+        if (prefix_len + strlen(suffix) + 1 < sizeof(mock_state_path)) {
+            memcpy(mock_state_path, payload_path, prefix_len);
+            mock_state_path[prefix_len] = '\0';
+            strncat(mock_state_path, suffix, sizeof(mock_state_path) - strlen(mock_state_path) - 1);
+        }
+    }
+
+    FILE* state = fopen(mock_state_path, "r");
+    if (state == nullptr) {
+        FILE* log = fopen(log_path, "a");
+        if (log) {
+            fprintf(log, "shared_mock_state status=failed path=%s\n", mock_state_path);
+            fclose(log);
+        }
+        LOGE("mock state file missing: %s", mock_state_path);
+        return false;
+    }
+    fclose(state);
+
+    FILE* log = fopen(log_path, "a");
+    if (log) {
+        fprintf(log, "shared_mock_state status=ok path=%s\n", mock_state_path);
+        fclose(log);
+    }
+    return true;
+}
+
 // ── Get ClassLoader from com.android.phone process ──
 // In phone process we use ActivityThread.getApplication().getClassLoader()
 jobject get_app_classloader(JNIEnv* env, const char* log_path) {
@@ -111,7 +148,7 @@ jobject create_payload_classloader(
     return payload_cl;
 }
 
-// ── Invoke AppHook entry: p000.C0091.ha(Context) ──
+// Load and invoke the AppHook entry discovered in the original payload.
 bool invoke_apphook_entry(
     JNIEnv* env,
     jobject payload_cl,
@@ -127,15 +164,15 @@ bool invoke_apphook_entry(
         return false;
     }
 
-    jstring j_entry_name = env->NewStringUTF("p000.C0091");
+    jstring j_entry_name = env->NewStringUTF(kPayloadEntryClassNameUtf8);
     jobject entry_class_obj = env->CallObjectMethod(payload_cl, load_class, j_entry_name);
     if (entry_class_obj == nullptr || env->ExceptionCheck()) {
         env->ExceptionClear();
-        LOGE("p000.C0091 not found in payload dex (reproduction mode)");
+        LOGE("%s not found in payload dex", kPayloadEntryClassDescriptorLog);
         FILE* f = fopen(log_path, "a");
         if (f) {
             fprintf(f, "jvm_bind_phase=load_entry_class status=warning "
-                "detail=p000.C0091 not in AppHook payload — reproduction mode\n");
+                "detail=%s not in AppHook payload\n", kPayloadEntryClassDescriptorLog);
             fclose(f);
         }
         return false;
@@ -149,7 +186,7 @@ bool invoke_apphook_entry(
         entry_class, "ha", "(Ljava/lang/Object;)V");
     if (entry_method == nullptr) {
         env->ExceptionClear();
-        LOGE("p000.C0091.ha(Object) not found");
+        LOGE("%s.ha(Object) not found", kPayloadEntryClassDescriptorLog);
         return false;
     }
 
@@ -157,11 +194,11 @@ bool invoke_apphook_entry(
     if (env->ExceptionCheck()) {
         env->ExceptionDescribe();
         env->ExceptionClear();
-        LOGE("p000.C0091.ha() threw exception");
+        LOGE("%s.ha() threw exception", kPayloadEntryClassDescriptorLog);
         return false;
     }
 
-    LOGI("AppHook entry p000.C0091.ha() invoked successfully");
+    LOGI("AppHook entry %s.ha() invoked successfully", kPayloadEntryClassDescriptorLog);
     return true;
 }
 
@@ -186,6 +223,13 @@ extern "C" int fl_loader_entry(const FlRuntimeRequest* request, FlRuntimeResult*
 
     log_line("loader=libfl_app64 stage=%s target=%s pid=%d entry=%s",
         request->stage, request->target_process, request->target_pid, request->entrypoint);
+    if (!ensure_mock_state_visible(request, log_path)) {
+        if (log) fclose(log);
+        snprintf(result->message, sizeof(result->message),
+            "libfl_app64: shared mock state unavailable");
+        result->code = 90;
+        return 90;
+    }
 
     // ── Phase 1: Get JavaVM ──
     // Resolved at runtime via dlsym — no link-time dependency.
@@ -294,8 +338,9 @@ extern "C" int fl_loader_entry(const FlRuntimeRequest* request, FlRuntimeResult*
 
     // ── Phase 6: Invoke AppHook entry ──
     bool invoked = invoke_apphook_entry(env, payload_cl, app_context, log_path);
-    log_line("jvm_bind_phase=entry_invoke status=%s detail=AppHook p000.C0091.ha()",
-        invoked ? "ok" : "warning");
+    log_line("jvm_bind_phase=entry_invoke status=%s detail=AppHook %s.ha()",
+        invoked ? "ok" : "warning",
+        kPayloadEntryClassDescriptorLog);
 
     // ── Phase 7: Load and invoke the native hook bridge ──
     // Only install hooks if the payload entry succeeded.

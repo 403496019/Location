@@ -4,6 +4,7 @@ import android.content.Context
 import dev.lerist.fakelocation.core.hookbridge.CompatHookBridge
 import dev.lerist.fakelocation.core.hookbridge.HookMethodSpec
 import dev.lerist.fakelocation.core.hookbridge.NativeHookBridge
+import dev.lerist.fakelocation.core.ipc.MockCellManager
 import dev.lerist.fakelocation.core.ipc.InMemoryMockServiceRegistry
 import dev.lerist.fakelocation.core.ipc.MockLocationManager
 import dev.lerist.fakelocation.core.ipc.MockWifiManager
@@ -23,11 +24,13 @@ class SharedPayloadEntrypoint(
     private val registry: InMemoryMockServiceRegistry = InMemoryMockServiceRegistry(),
     private val locationManager: MockLocationManager,
     private val wifiManager: MockWifiManager,
+    private val cellManager: MockCellManager,
     private val nativeCatchManager: NativeCatchManager,
 ) {
     fun init(@Suppress("UNUSED_PARAMETER") context: Context): PayloadActivationReport {
         ensureRegistered(ServiceNames.MOCK_LOCATION, locationManager)
         ensureRegistered(ServiceNames.MOCK_WIFI, wifiManager)
+        ensureRegistered(ServiceNames.MOCK_CELLS, cellManager)
         ensureRegistered(ServiceNames.NATIVE_CATCH, nativeCatchManager)
         val installResults = installSystemServerBootstrapHooks()
         return PayloadActivationReport(

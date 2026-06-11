@@ -24,6 +24,8 @@
 
 namespace {
 
+constexpr const char* kRemoteExecutionLogRoot = "/data/local/tmp/fakelocation/logs";
+
 struct ParsedArgs {
     std::string targetProcess;
     std::string stage;
@@ -34,6 +36,7 @@ struct ParsedArgs {
     std::string entrypoint;
     std::string logPath;
     bool dryRun = false;
+    bool stdoutOnly = false;
 };
 
 struct RemoteModuleInfo {
@@ -61,6 +64,9 @@ struct RegisterSnapshot {
 };
 
 struct RemoteArgumentLayout {
+    size_t targetProcessOffset = 0;
+    size_t stageOffset = 0;
+    size_t abiOffset = 0;
     size_t totalSize = 0;
     size_t totalSizeAligned = 0;
     size_t loaderPathOffset = 0;
@@ -68,6 +74,8 @@ struct RemoteArgumentLayout {
     size_t payloadPathOffset = 0;
     size_t hookSeedPathOffset = 0;
     size_t entrypointOffset = 0;
+    size_t logPathOffset = 0;
+    size_t planPathOffset = 0;
 };
 
 struct RemoteTransactionLayout {
@@ -77,6 +85,8 @@ struct RemoteTransactionLayout {
     size_t requestBlockSize = 0;
     size_t resultBlockOffset = 0;
     size_t resultBlockSize = 0;
+    size_t symbolNameOffset = 0;
+    size_t symbolNameSize = 0;
     size_t totalSize = 0;
     size_t totalSizeAligned = 0;
 };
@@ -315,6 +325,14 @@ std::string derive_hook_seed_path(const std::string& payload_path) {
     return payload_path.substr(0, payload_index) + "/metadata/hook-registry-seed.txt";
 }
 
+std::string derive_mock_state_path(const std::string& payload_path) {
+    size_t payload_index = payload_path.rfind("/payload/");
+    if (payload_index == std::string::npos) {
+        return "/data/fl/metadata/mock-location-state.txt";
+    }
+    return payload_path.substr(0, payload_index) + "/metadata/mock-location-state.txt";
+}
+
 std::string derive_plan_path(const std::string& process_name, const std::string& stage) {
     std::string safe = process_name;
     for (char& ch : safe) {
@@ -322,7 +340,7 @@ std::string derive_plan_path(const std::string& process_name, const std::string&
             ch = '_';
         }
     }
-    return "/data/fl/logs/injection_plan_" + safe + "_" + stage + ".txt";
+    return std::string(kRemoteExecutionLogRoot) + "/injection_plan_" + safe + "_" + stage + ".txt";
 }
 
 bool looks_like_elf(const std::string& path) {
@@ -341,6 +359,12 @@ size_t align_up(size_t value, size_t alignment) {
 RemoteArgumentLayout build_remote_argument_layout(const FlRuntimeRequest& request) {
     RemoteArgumentLayout layout;
     size_t cursor = 0;
+    layout.targetProcessOffset = cursor;
+    cursor += strlen(request.target_process != nullptr ? request.target_process : "") + 1;
+    layout.stageOffset = cursor;
+    cursor += strlen(request.stage != nullptr ? request.stage : "") + 1;
+    layout.abiOffset = cursor;
+    cursor += strlen(request.abi != nullptr ? request.abi : "") + 1;
     layout.loaderPathOffset = cursor;
     cursor += strlen(request.loader_path) + 1;
     layout.hookBridgePathOffset = cursor;
@@ -351,6 +375,10 @@ RemoteArgumentLayout build_remote_argument_layout(const FlRuntimeRequest& reques
     cursor += strlen(request.hook_seed_path != nullptr ? request.hook_seed_path : "") + 1;
     layout.entrypointOffset = cursor;
     cursor += strlen(request.entrypoint) + 1;
+    layout.logPathOffset = cursor;
+    cursor += strlen(request.log_path != nullptr ? request.log_path : "") + 1;
+    layout.planPathOffset = cursor;
+    cursor += strlen(request.plan_path != nullptr ? request.plan_path : "") + 1;
     layout.totalSize = cursor;
     layout.totalSizeAligned = align_up(cursor, 4096);
     return layout;
@@ -361,13 +389,16 @@ RemoteTransactionLayout build_remote_transaction_layout(
     const RemoteArgumentLayout& args
 ) {
     RemoteTransactionLayout layout;
+    constexpr size_t kRemoteSymbolNameSize = 64;
     layout.stringBlockOffset = 0;
     layout.stringBlockSize = args.totalSize;
     layout.requestBlockOffset = align_up(layout.stringBlockOffset + layout.stringBlockSize, alignof(FlRuntimeRequest));
     layout.requestBlockSize = sizeof(FlRuntimeRequest);
     layout.resultBlockOffset = align_up(layout.requestBlockOffset + layout.requestBlockSize, alignof(FlRuntimeResult));
     layout.resultBlockSize = sizeof(FlRuntimeResult);
-    layout.totalSize = layout.resultBlockOffset + layout.resultBlockSize;
+    layout.symbolNameOffset = align_up(layout.resultBlockOffset + layout.resultBlockSize, alignof(char));
+    layout.symbolNameSize = kRemoteSymbolNameSize;
+    layout.totalSize = layout.symbolNameOffset + layout.symbolNameSize;
     layout.totalSizeAligned = align_up(layout.totalSize, 4096);
     return layout;
 }
@@ -386,11 +417,16 @@ std::vector<unsigned char> build_remote_string_block(
             memcpy(block.data() + offset, value, len + 1);
         }
     };
+    write_string(layout.targetProcessOffset, request.target_process);
+    write_string(layout.stageOffset, request.stage);
+    write_string(layout.abiOffset, request.abi);
     write_string(layout.loaderPathOffset, request.loader_path);
     write_string(layout.hookBridgePathOffset, request.hook_bridge_path);
     write_string(layout.payloadPathOffset, request.payload_path);
     write_string(layout.hookSeedPathOffset, request.hook_seed_path);
     write_string(layout.entrypointOffset, request.entrypoint);
+    write_string(layout.logPathOffset, request.log_path);
+    write_string(layout.planPathOffset, request.plan_path);
     return block;
 }
 
@@ -566,6 +602,9 @@ bool execute_remote_injection(
         string_block.data(), string_block.size());
     // Build request struct with pointers rebased into remote block
     FlRuntimeRequest remote_req = request;
+    remote_req.target_process   = nullptr;
+    remote_req.stage            = nullptr;
+    remote_req.abi              = nullptr;
     remote_req.loader_path      = nullptr;  // will be patched below
     remote_req.hook_bridge_path = nullptr;
     remote_req.payload_path     = nullptr;
@@ -573,19 +612,17 @@ bool execute_remote_injection(
     remote_req.entrypoint       = nullptr;
     remote_req.log_path         = nullptr;
     remote_req.plan_path        = nullptr;
-    // Patch string pointers to offsets inside remote_block
-    // (the loader reads strings from the string block, not through the request struct,
-    //  so we leave them as nullptr — the loader's fl_loader_entry has the actual paths
-    //  already baked into the string block.  We only need the request for the result.)
-    // Actually, the loader uses request fields directly.  We need to point them into
-    // the remote string block.
+    // Patch string pointers to offsets inside remote_block.
+    remote_req.target_process   = reinterpret_cast<const char*>(remote_block + args_layout.targetProcessOffset);
+    remote_req.stage            = reinterpret_cast<const char*>(remote_block + args_layout.stageOffset);
+    remote_req.abi              = reinterpret_cast<const char*>(remote_block + args_layout.abiOffset);
     remote_req.loader_path      = reinterpret_cast<const char*>(remote_block + args_layout.loaderPathOffset);
     remote_req.hook_bridge_path = reinterpret_cast<const char*>(remote_block + args_layout.hookBridgePathOffset);
     remote_req.payload_path     = reinterpret_cast<const char*>(remote_block + args_layout.payloadPathOffset);
     remote_req.hook_seed_path   = reinterpret_cast<const char*>(remote_block + args_layout.hookSeedPathOffset);
     remote_req.entrypoint       = reinterpret_cast<const char*>(remote_block + args_layout.entrypointOffset);
-    // log_path and plan_path point to static paths — write them into the string block too
-    // (they are small fixed strings)
+    remote_req.log_path         = reinterpret_cast<const char*>(remote_block + args_layout.logPathOffset);
+    remote_req.plan_path        = reinterpret_cast<const char*>(remote_block + args_layout.planPathOffset);
 
     memcpy(blob.data() + tx_layout.requestBlockOffset, &remote_req, sizeof(remote_req));
     // Zero-initialize the result block
@@ -612,17 +649,17 @@ bool execute_remote_injection(
 
     // Step 4 — write "fl_loader_entry\0" string into remote block for dlsym
     const char* entry_sym = "fl_loader_entry";
-    // Place the symbol name right after the string block in our blob (temporary area)
-    const size_t sym_name_offset = tx_layout.requestBlockOffset + tx_layout.requestBlockSize;
+    // Place the symbol name in the dedicated scratch area after the result block.
+    const size_t sym_name_offset = tx_layout.symbolNameOffset;
     if (sym_name_offset + strlen(entry_sym) + 1 <= blob.size()) {
         memcpy(blob.data() + sym_name_offset, entry_sym, strlen(entry_sym) + 1);
         wrote = remote_mem_write(pid, remote_block + sym_name_offset,
             blob.data() + sym_name_offset, strlen(entry_sym) + 1);
-        if (wrote != static_cast<ssize_t>(strlen(entry_sym) + 1)) {
-            write_log_line(log_path, "remote_inject: write sym name failed");
-            return false;
+            if (wrote != static_cast<ssize_t>(strlen(entry_sym) + 1)) {
+                write_log_line(log_path, "remote_inject: write sym name failed");
+                return false;
+            }
         }
-    }
 
     // Step 5 — remote dlsym(handle, "fl_loader_entry")
     aarch64_set_call_regs(pid, saved_regs, dlsym_plan.remoteSymbol,
@@ -769,6 +806,9 @@ void write_injection_plan(
     fprintf(file, "payload_size=%ld\n", file_size_or_minus_one(request.payload_path));
     fprintf(file, "hook_seed_path=%s\n", request.hook_seed_path ? request.hook_seed_path : "none");
     fprintf(file, "hook_seed_size=%ld\n", file_size_or_minus_one(request.hook_seed_path ? request.hook_seed_path : ""));
+    std::string mock_state_path = derive_mock_state_path(request.payload_path);
+    fprintf(file, "mock_state_path=%s\n", mock_state_path.c_str());
+    fprintf(file, "mock_state_size=%ld\n", file_size_or_minus_one(mock_state_path));
     fprintf(file, "ptrace_probe_ok=%s\n", ptrace_ok ? "true" : "false");
     fprintf(file, "ptrace_probe_detail=%s\n", ptrace_detail.c_str());
     fprintf(file, "register_snapshot_available=%s\n", register_snapshot.available ? "true" : "false");
@@ -889,6 +929,8 @@ bool parse_args(int argc, char** argv, ParsedArgs* parsed) {
             if (!require_value(&parsed->logPath)) return false;
         } else if (arg == "--dry-run") {
             parsed->dryRun = true;
+        } else if (arg == "--stdout-only") {
+            parsed->stdoutOnly = true;
         } else {
             fprintf(stderr, "inj64: unknown argument %s\n", arg.c_str());
             return false;
@@ -918,21 +960,27 @@ int main(int argc, char** argv) {
         return 64;
     }
 
-    if (parsed.logPath.empty()) {
+    if (!parsed.stdoutOnly && parsed.logPath.empty()) {
         std::string safe = parsed.targetProcess;
         for (char& ch : safe) {
             if (ch == '.' || ch == ':') {
                 ch = '_';
             }
         }
-        parsed.logPath = "/data/fl/logs/inj64_" + safe + "_" + parsed.stage + ".log";
+        parsed.logPath = std::string(kRemoteExecutionLogRoot) + "/inj64_" + safe + "_" + parsed.stage + ".log";
     }
-    ensure_parent_dir(parsed.logPath);
+    if (!parsed.logPath.empty()) {
+        ensure_parent_dir(parsed.logPath);
+    }
 
     const int target_pid = find_pid_by_process_name(parsed.targetProcess);
     const char* selinux = read_selinux_mode();
     std::string hook_seed_path = derive_hook_seed_path(parsed.payloadPath);
-    std::string plan_path = derive_plan_path(parsed.targetProcess, parsed.stage);
+    std::string mock_state_path = derive_mock_state_path(parsed.payloadPath);
+    std::string plan_path;
+    if (!parsed.stdoutOnly) {
+        plan_path = derive_plan_path(parsed.targetProcess, parsed.stage);
+    }
     write_log_line(parsed.logPath.c_str(), "[inj64] target=%s stage=%s abi=%s selinux=%s",
         parsed.targetProcess.c_str(), parsed.stage.c_str(), parsed.abi.c_str(), selinux);
 
@@ -943,11 +991,15 @@ int main(int argc, char** argv) {
     }
     print_and_log(parsed.logPath.c_str(), "phase=attach status=ok detail=pid=%d", target_pid);
 
-    if (!file_exists(parsed.loaderPath) || !file_exists(parsed.hookBridgePath) || !file_exists(parsed.payloadPath)) {
+    if (!file_exists(parsed.loaderPath) ||
+        !file_exists(parsed.hookBridgePath) ||
+        !file_exists(parsed.payloadPath) ||
+        !file_exists(mock_state_path)) {
         print_and_log(parsed.logPath.c_str(), "phase=preflight status=failed detail=artifact missing");
         fprintf(stderr, "inj64: required runtime artifact missing\n");
         return 66;
     }
+    print_and_log(parsed.logPath.c_str(), "phase=mock_state status=ok detail=state=%s", mock_state_path.c_str());
 
     if (parsed.dryRun) {
         print_and_log(parsed.logPath.c_str(), "phase=preflight status=ok detail=dry-run");
@@ -974,8 +1026,8 @@ int main(int argc, char** argv) {
     request.payload_path = parsed.payloadPath.c_str();
     request.hook_seed_path = hook_seed_path.c_str();
     request.entrypoint = parsed.entrypoint.c_str();
-    request.log_path = parsed.logPath.c_str();
-    request.plan_path = plan_path.c_str();
+    request.log_path = parsed.logPath.empty() ? nullptr : parsed.logPath.c_str();
+    request.plan_path = plan_path.empty() ? nullptr : plan_path.c_str();
     request.dry_run = 0;
     request.target_pid = target_pid;
 
@@ -1071,8 +1123,9 @@ int main(int argc, char** argv) {
         ptrace_ok,
         ptrace_detail
     );
-    print_and_log(parsed.logPath.c_str(), "phase=remote_plan status=ok detail=plan=%s",
-        plan_path.c_str());
+    print_and_log(parsed.logPath.c_str(), "phase=remote_plan status=%s detail=%s",
+        plan_path.empty() ? "skipped" : "ok",
+        plan_path.empty() ? "stdout-only" : plan_path.c_str());
 
     // ── local hook bridge ping (pre-flight validation) ──
     FlRuntimeResult hook_result = {};
@@ -1178,33 +1231,37 @@ int main(int argc, char** argv) {
             ch = '_';
         }
     }
-    std::string marker_path = "/data/fl/logs/last_injection_" + safe + "_" + parsed.stage + ".txt";
-    ensure_parent_dir(marker_path);
-    FILE* marker = fopen(marker_path.c_str(), "w");
-    if (marker != nullptr) {
-        fprintf(marker, "status=%s\n",
-            loader_code == 0 ? (remote_executed ? "remote_loader_ok" : "local_loader_ok") : "loader_failed");
-        fprintf(marker, "target_process=%s\n", parsed.targetProcess.c_str());
-        fprintf(marker, "pid=%d\n", target_pid);
-        fprintf(marker, "stage=%s\n", parsed.stage.c_str());
-        fprintf(marker, "entrypoint=%s\n", parsed.entrypoint.c_str());
-        fprintf(marker, "selinux=%s\n", selinux);
-        fprintf(marker, "loader=%s\n", parsed.loaderPath.c_str());
-        fprintf(marker, "hook_bridge=%s\n", parsed.hookBridgePath.c_str());
-        fprintf(marker, "payload=%s\n", parsed.payloadPath.c_str());
-        fprintf(marker, "hook_seed=%s\n", hook_seed_path.c_str());
-        fprintf(marker, "plan_path=%s\n", plan_path.c_str());
-        fprintf(marker, "ptrace_probe_ok=%s\n", ptrace_ok ? "true" : "false");
-        fprintf(marker, "remote_possible=%s\n", remote_possible ? "true" : "false");
-        fprintf(marker, "remote_executed=%s\n", remote_executed ? "true" : "false");
-        fprintf(marker, "ptrace_probe_detail=%s\n", ptrace_detail.c_str());
-        fprintf(marker, "loader_result_code=%d\n", loader_result.code);
-        fprintf(marker, "loader_result_message=%s\n", loader_result.message);
-        fclose(marker);
+    std::string marker_path;
+    if (!parsed.stdoutOnly) {
+        marker_path = std::string(kRemoteExecutionLogRoot) + "/last_injection_" + safe + "_" + parsed.stage + ".txt";
+        ensure_parent_dir(marker_path);
+        FILE* marker = fopen(marker_path.c_str(), "w");
+        if (marker != nullptr) {
+            fprintf(marker, "status=%s\n",
+                loader_code == 0 ? (remote_executed ? "remote_loader_ok" : "local_loader_ok") : "loader_failed");
+            fprintf(marker, "target_process=%s\n", parsed.targetProcess.c_str());
+            fprintf(marker, "pid=%d\n", target_pid);
+            fprintf(marker, "stage=%s\n", parsed.stage.c_str());
+            fprintf(marker, "entrypoint=%s\n", parsed.entrypoint.c_str());
+            fprintf(marker, "selinux=%s\n", selinux);
+            fprintf(marker, "loader=%s\n", parsed.loaderPath.c_str());
+            fprintf(marker, "hook_bridge=%s\n", parsed.hookBridgePath.c_str());
+            fprintf(marker, "payload=%s\n", parsed.payloadPath.c_str());
+            fprintf(marker, "hook_seed=%s\n", hook_seed_path.c_str());
+            fprintf(marker, "mock_state=%s\n", mock_state_path.c_str());
+            fprintf(marker, "plan_path=%s\n", plan_path.c_str());
+            fprintf(marker, "ptrace_probe_ok=%s\n", ptrace_ok ? "true" : "false");
+            fprintf(marker, "remote_possible=%s\n", remote_possible ? "true" : "false");
+            fprintf(marker, "remote_executed=%s\n", remote_executed ? "true" : "false");
+            fprintf(marker, "ptrace_probe_detail=%s\n", ptrace_detail.c_str());
+            fprintf(marker, "loader_result_code=%d\n", loader_result.code);
+            fprintf(marker, "loader_result_message=%s\n", loader_result.message);
+            fclose(marker);
+        }
     }
     print_and_log(parsed.logPath.c_str(), "phase=finalize status=%s detail=marker=%s remote=%s",
         loader_code == 0 ? "ok" : "failed",
-        marker_path.c_str(),
+        marker_path.empty() ? "stdout-only" : marker_path.c_str(),
         remote_executed ? "true" : "false");
 
     if (loader_code != 0) {
@@ -1213,7 +1270,8 @@ int main(int argc, char** argv) {
     }
     printf("inj64 execute ok target=%s pid=%d stage=%s log=%s marker=%s remote=%s\n",
         parsed.targetProcess.c_str(), target_pid, parsed.stage.c_str(),
-        parsed.logPath.c_str(), marker_path.c_str(),
+        parsed.logPath.empty() ? "stdout-only" : parsed.logPath.c_str(),
+        marker_path.empty() ? "stdout-only" : marker_path.c_str(),
         remote_executed ? "true" : "false");
     return 0;
 }

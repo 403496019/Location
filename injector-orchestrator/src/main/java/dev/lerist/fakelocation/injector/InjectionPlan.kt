@@ -11,6 +11,8 @@ enum class InjectionStage {
     APP_HOOK_STAGE,
 }
 
+private const val REMOTE_EXECUTION_LOG_ROOT = "/data/local/tmp/fakelocation/logs"
+
 data class InjectionPlan(
     val processName: String,
     val role: TargetProcessRole,
@@ -96,11 +98,11 @@ class DefaultInjectionOrchestrator(
             val injectorArtifact = requireArtifact(report, plan.injectorLogicalName)
             val rootScript = requireTaskScript(scriptBundle, plan.processName)
             val safeProcess = safeProcessName(plan.processName)
-            val logFilePath = "/data/fl/logs/${scriptNameForPlan(plan).removeSuffix(".sh")}.log"
+            val logFilePath = "$REMOTE_EXECUTION_LOG_ROOT/${scriptNameForPlan(plan).removeSuffix(".sh")}.log"
             val markerFilePath =
-                "/data/fl/logs/last_injection_${safeProcess}_${plan.stage.name.lowercase()}.txt"
+                "$REMOTE_EXECUTION_LOG_ROOT/last_injection_${safeProcess}_${plan.stage.name.lowercase()}.txt"
             val planFilePath =
-                "/data/fl/logs/injection_plan_${safeProcess}_${plan.stage.name.lowercase()}.txt"
+                "$REMOTE_EXECUTION_LOG_ROOT/injection_plan_${safeProcess}_${plan.stage.name.lowercase()}.txt"
             val notes = buildList {
                 add("stage=${plan.stage}")
                 add("entrypoint=${plan.javaEntrypoint}")
@@ -286,6 +288,7 @@ class DefaultInjectionOrchestrator(
             add("chmod 644 ${shellQuote("$sharedRoot/native/libfl_app64.so")}")
             add("chmod 644 ${shellQuote("$sharedRoot/native/liblh64.so")}")
             add("chmod 644 ${shellQuote("$sharedRoot/metadata/hook-registry-seed.txt")}")
+            add("chmod 644 ${shellQuote("$sharedRoot/metadata/mock-location-state.txt")}")
         }
         val ownershipCommands = buildList {
             add("chown root:root ${shellQuote(sharedRoot)}")
@@ -312,6 +315,7 @@ class DefaultInjectionOrchestrator(
             "test -f ${shellQuote("$sharedRoot/native/libfl_app64.so")}",
             "test -f ${shellQuote("$sharedRoot/native/liblh64.so")}",
             "test -f ${shellQuote("$sharedRoot/bin/inj64")}",
+            "test -f ${shellQuote("$sharedRoot/metadata/mock-location-state.txt")}",
             *scriptBundle.scripts.map { script ->
                 "test -f ${shellQuote(script.sharedPathHint)}"
             }.toTypedArray(),
@@ -519,6 +523,7 @@ class DefaultInjectionOrchestrator(
             add("chmod 644 ${shellQuote("$sharedRoot/native/libfl_app64.so")}")
             add("chmod 644 ${shellQuote("$sharedRoot/native/liblh64.so")}")
             add("chmod 644 ${shellQuote("$sharedRoot/metadata/hook-registry-seed.txt")}")
+            add("chmod 644 ${shellQuote("$sharedRoot/metadata/mock-location-state.txt")}")
         }
         val ownershipCommands = buildList {
             add("chown root:root ${shellQuote(sharedRoot)}")
@@ -547,6 +552,7 @@ class DefaultInjectionOrchestrator(
             add("test -f ${shellQuote("$sharedRoot/native/liblh64.so")}")
             add("test -f ${shellQuote("$sharedRoot/bin/inj64")}")
             add("test -f ${shellQuote("$sharedRoot/scripts/sync_runtime.sh")}")
+            add("test -f ${shellQuote("$sharedRoot/metadata/mock-location-state.txt")}")
             taskScripts.forEach { script ->
                 add("test -f ${shellQuote(script.sharedPathHint)}")
             }
@@ -580,7 +586,7 @@ class DefaultInjectionOrchestrator(
             injectorArtifact = injectorArtifact,
             useSharedPaths = true,
         )
-        val logFile = "/data/fl/logs/${scriptNameForPlan(plan).removeSuffix(".sh")}.log"
+        val mockStateFile = "/data/fl/metadata/mock-location-state.txt"
         return """
             |#!/system/bin/sh
             |set -eu
@@ -588,12 +594,8 @@ class DefaultInjectionOrchestrator(
             |MODE="${'$'}{1:-dry-run}"
             |TARGET_PID="$(pidof ${shellQuote(plan.processName)} 2>/dev/null | awk '{print ${'$'}1}')"
             |SELINUX="$(getenforce 2>/dev/null || echo unknown)"
-            |LOG_FILE=${shellQuote(logFile)}
             |echo "[inject] process=${plan.processName} stage=${plan.stage} mode=${'$'}MODE"
-            |CMD="${sharedInvocation} --log-file ${shellQuote(logFile)}"
-            |
-            |mkdir -p /data/fl/logs 2>/dev/null || true
-            |echo "script_target=${plan.processName} stage=${plan.stage} mode=${'$'}MODE pid=${'$'}TARGET_PID selinux=${'$'}SELINUX" >> "${'$'}LOG_FILE"
+            |echo "script_target=${plan.processName} stage=${plan.stage} mode=${'$'}MODE pid=${'$'}TARGET_PID selinux=${'$'}SELINUX"
             |
             |if [ -z "${'$'}TARGET_PID" ]; then
             |  echo "target process not running: ${plan.processName}" >&2
@@ -615,8 +617,16 @@ class DefaultInjectionOrchestrator(
             |  exit 24
             |fi
             |
+            |if [ ! -f ${shellQuote(mockStateFile)} ]; then
+            |  echo "missing shared mock state: ${mockStateFile}" >&2
+            |  exit 25
+            |fi
+            |
+            |echo "shared_mock_state=${mockStateFile}"
+            |grep -E '^(location_active|latitude|longitude|provider|wifi_active|wifi_ssid|wifi_bssid|cells_active|cells_count|cell_primary_mcc|cell_primary_mnc|cell_primary_lac_or_tac|cell_primary_cid_or_nci)=' ${shellQuote(mockStateFile)} 2>/dev/null || true
+            |
             |if [ "${'$'}MODE" = "dry-run" ]; then
-            |  echo "${'$'}CMD --dry-run"
+            |  echo "${sharedInvocation} --stdout-only --dry-run"
             |  exit 0
             |fi
             |
@@ -626,10 +636,10 @@ class DefaultInjectionOrchestrator(
             |fi
             |
             |if [ "${'$'}SELINUX" = "Enforcing" ]; then
-            |  echo "warning: SELinux is enforcing; original flow commonly expects permissive" >> "${'$'}LOG_FILE"
+            |  echo "warning: SELinux is enforcing; original flow commonly expects permissive"
             |fi
             |
-            |exec ${'$'}CMD
+            |exec ${sharedInvocation} --stdout-only
         """.trimMargin()
     }
 

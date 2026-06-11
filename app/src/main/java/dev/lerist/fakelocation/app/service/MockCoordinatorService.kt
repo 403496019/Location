@@ -14,6 +14,7 @@ class MockCoordinatorService : Service() {
             ACTION_STOP_SESSION -> appGraph.runtimeController.stopSession()
             ACTION_UPDATE_DEMO_LOCATION -> appGraph.runtimeController.updateDemoLocation()
             ACTION_UPDATE_DEMO_WIFI -> appGraph.runtimeController.updateDemoWifi()
+            ACTION_UPDATE_DEMO_CELLS -> appGraph.runtimeController.updateDemoCells()
             ACTION_RUN_PREFLIGHT_CHECKS -> appGraph.runtimeController.runPreflightChecks()
             ACTION_PROBE_ROOT -> appGraph.runtimeController.probeRootShell()
             ACTION_SYNC_RUNTIME_MIRROR -> appGraph.runtimeController.syncRuntimeMirror()
@@ -32,6 +33,7 @@ class MockCoordinatorService : Service() {
         const val ACTION_STOP_SESSION = "dev.lerist.fakelocation.action.STOP_SESSION"
         const val ACTION_UPDATE_DEMO_LOCATION = "dev.lerist.fakelocation.action.UPDATE_DEMO_LOCATION"
         const val ACTION_UPDATE_DEMO_WIFI = "dev.lerist.fakelocation.action.UPDATE_DEMO_WIFI"
+        const val ACTION_UPDATE_DEMO_CELLS = "dev.lerist.fakelocation.action.UPDATE_DEMO_CELLS"
         const val ACTION_RUN_PREFLIGHT_CHECKS =
             "dev.lerist.fakelocation.action.RUN_PREFLIGHT_CHECKS"
         const val ACTION_PROBE_ROOT = "dev.lerist.fakelocation.action.PROBE_ROOT"

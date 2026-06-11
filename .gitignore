@@ -14,3 +14,4 @@
 *.jks
 *.log
 *.tmp
+window_dump*.xml

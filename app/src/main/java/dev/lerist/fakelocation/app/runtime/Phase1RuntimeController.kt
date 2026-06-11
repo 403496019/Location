@@ -4,11 +4,14 @@ import android.content.Context
 import dev.lerist.fakelocation.core.hookbridge.CompatHookBridge
 import dev.lerist.fakelocation.core.hookbridge.HookInstallResult
 import dev.lerist.fakelocation.core.hookbridge.NativeHookBridge
+import dev.lerist.fakelocation.core.ipc.InMemoryMockCellManager
 import dev.lerist.fakelocation.core.ipc.InMemoryMockLocationManager
 import dev.lerist.fakelocation.core.ipc.InMemoryMockServiceRegistry
 import dev.lerist.fakelocation.core.ipc.InMemoryMockStateStore
 import dev.lerist.fakelocation.core.ipc.InMemoryMockWifiManager
-import dev.lerist.fakelocation.core.ipc.InMemoryNativeCatchManager
+import dev.lerist.fakelocation.core.ipc.NativeCatchManager
+import dev.lerist.fakelocation.core.ipc.NativeLocationSyncReport
+import dev.lerist.fakelocation.core.model.MockCellRecord
 import dev.lerist.fakelocation.core.model.MockLocation
 import dev.lerist.fakelocation.core.model.MockSessionState
 import dev.lerist.fakelocation.core.model.MockWifiProfile
@@ -17,6 +20,7 @@ import dev.lerist.fakelocation.core.runtime.RuntimeIntegrityReport
 import dev.lerist.fakelocation.core.runtime.RuntimeAssetManager
 import dev.lerist.fakelocation.core.runtime.RuntimePreparationReport
 import dev.lerist.fakelocation.core.runtime.StagedRuntimeArtifact
+import dev.lerist.fakelocation.injector.AndroidShellExecutor
 import dev.lerist.fakelocation.injector.CommandExecutionReport
 import dev.lerist.fakelocation.injector.DefaultInjectionOrchestrator
 import dev.lerist.fakelocation.injector.InjectionPreflightReport
@@ -42,6 +46,40 @@ data class LocationChainProbe(
     val notes: List<String>,
 )
 
+data class MockStateMirrorObservation(
+    val localPath: String,
+    val localContent: String?,
+    val sharedPath: String,
+    val sharedContent: String?,
+    val contentsMatch: Boolean,
+    val detail: String,
+    val observedAtMillis: Long,
+)
+
+data class RemoteTaskObservation(
+    val processName: String,
+    val stage: String,
+    val logFilePath: String,
+    val logExcerpt: String?,
+    val markerFilePath: String,
+    val markerContent: String?,
+    val planFilePath: String,
+    val planContent: String?,
+    val markerStatus: String?,
+    val ptraceProbeOk: Boolean?,
+    val remotePossible: Boolean?,
+    val remoteExecuted: Boolean?,
+    val loaderResultCode: Int?,
+    val remoteAttachStatus: String?,
+    val remoteSymbolPlanStatus: String?,
+    val entryDispatchStatus: String?,
+    val hookInstallSummary: String?,
+    val sharedMockStateVisible: Boolean?,
+    val overallSuccess: Boolean,
+    val detail: String,
+    val observedAtMillis: Long,
+)
+
 data class RuntimeSnapshot(
     val runtimePrepared: Boolean,
     val hiddenApiAttempted: Boolean,
@@ -62,6 +100,9 @@ data class RuntimeSnapshot(
     val generatedRootScripts: List<GeneratedRootScript>,
     val registeredServices: List<String>,
     val sessionState: MockSessionState,
+    val nativeLocationSyncReport: NativeLocationSyncReport?,
+    val mockStateMirrorObservation: MockStateMirrorObservation?,
+    val remoteTaskObservations: List<RemoteTaskObservation>,
     val locationChainProbe: LocationChainProbe,
     val injectionPlans: List<InjectionPlan>,
     val injectionTasks: List<InjectionTask>,
@@ -78,9 +119,11 @@ class Phase1RuntimeController(
     private val serviceRegistry: InMemoryMockServiceRegistry,
     private val locationManager: InMemoryMockLocationManager,
     private val wifiManager: InMemoryMockWifiManager,
-    private val nativeCatchManager: InMemoryNativeCatchManager,
+    private val cellManager: InMemoryMockCellManager,
+    private val nativeCatchManager: NativeCatchManager,
     private val nativeHookBridge: NativeHookBridge,
     private val compatHookBridge: CompatHookBridge,
+    private val shellExecutor: AndroidShellExecutor,
     private val injectionOrchestrator: DefaultInjectionOrchestrator,
     private val payloadEntrypoint: SharedPayloadEntrypoint,
 ) {
@@ -98,6 +141,8 @@ class Phase1RuntimeController(
     private var runtimeMirrorSyncResult: RuntimeMirrorSyncResult? = null
     private var rootScriptBundle: RootScriptBundle? = null
     private var taskExecutions: List<InjectionTaskExecution> = emptyList()
+    private var mockStateMirrorObservation: MockStateMirrorObservation? = null
+    private var remoteTaskObservations: List<RemoteTaskObservation> = emptyList()
     private val payloadReports = mutableListOf<PayloadActivationReport>()
 
     fun bootstrap(): RuntimeSnapshot {
@@ -110,6 +155,7 @@ class Phase1RuntimeController(
             rootScriptBundle = injectionOrchestrator.buildRootScriptBundle(report)
             runtimeIntegrityReport = assetManager.verifyPreparationReport(report)
             injectionPreflightReport = injectionOrchestrator.buildPreflightReport(report)
+            remoteTaskObservations = observeRemoteTasks(report)
         }
         if (injectorEnvironment == null) {
             injectorEnvironment = injectionOrchestrator.probeInjectorEnvironment()
@@ -122,6 +168,7 @@ class Phase1RuntimeController(
             payloadReports += payloadEntrypoint.init(context)
             initStageActivated = true
         }
+        syncCurrentState()
         return snapshot()
     }
 
@@ -142,6 +189,13 @@ class Phase1RuntimeController(
         } else {
             locationManager.startMockLocation()
         }
+        if (stateStore.getState().currentWifiProfile == null) {
+            wifiManager.updateWifi(defaultDemoWifi())
+        }
+        if (stateStore.getState().currentCells.isEmpty()) {
+            cellManager.updateCells(defaultDemoCells())
+        }
+        syncCurrentState()
         return snapshot()
     }
 
@@ -149,18 +203,29 @@ class Phase1RuntimeController(
         sessionRunning = false
         locationManager.stopMockLocation()
         wifiManager.stopMockWifi()
+        cellManager.stopMockCells()
+        syncCurrentState()
         return snapshot()
     }
 
     fun updateDemoLocation(): RuntimeSnapshot {
         bootstrap()
         locationManager.updateLocation(defaultDemoLocation())
+        syncCurrentState()
         return snapshot()
     }
 
     fun updateDemoWifi(): RuntimeSnapshot {
         bootstrap()
         wifiManager.updateWifi(defaultDemoWifi())
+        syncCurrentState()
+        return snapshot()
+    }
+
+    fun updateDemoCells(): RuntimeSnapshot {
+        bootstrap()
+        cellManager.updateCells(defaultDemoCells())
+        syncCurrentState()
         return snapshot()
     }
 
@@ -180,6 +245,7 @@ class Phase1RuntimeController(
         rootScriptBundle = injectionOrchestrator.buildRootScriptBundle(report)
         runtimeIntegrityReport = assetManager.verifyPreparationReport(report)
         injectionPreflightReport = injectionOrchestrator.buildPreflightReport(report)
+        remoteTaskObservations = observeRemoteTasks(report)
         return snapshot()
     }
 
@@ -190,6 +256,7 @@ class Phase1RuntimeController(
         rootScriptBundle = injectionOrchestrator.buildRootScriptBundle(report)
         runtimeIntegrityReport = assetManager.verifyPreparationReport(report)
         injectionPreflightReport = injectionOrchestrator.buildPreflightReport(report)
+        remoteTaskObservations = observeRemoteTasks(report)
         return snapshot()
     }
 
@@ -201,6 +268,7 @@ class Phase1RuntimeController(
         runtimeIntegrityReport = assetManager.verifyPreparationReport(report)
         injectionPreflightReport = injectionOrchestrator.buildPreflightReport(report)
         taskExecutions = injectionOrchestrator.executeDryRunTasks(report)
+        remoteTaskObservations = observeRemoteTasks(report)
         return snapshot()
     }
 
@@ -215,6 +283,7 @@ class Phase1RuntimeController(
             report = report,
             mode = RootScriptMode.EXECUTE,
         )
+        remoteTaskObservations = observeRemoteTasks(report)
         return snapshot()
     }
 
@@ -240,6 +309,11 @@ class Phase1RuntimeController(
             generatedRootScripts = rootScriptBundle?.scripts.orEmpty(),
             registeredServices = serviceRegistry.listServiceNames(),
             sessionState = stateStore.getState(),
+            nativeLocationSyncReport = nativeCatchManager.getLastSyncReport(),
+            mockStateMirrorObservation = mockStateMirrorObservation ?: observeMockStateMirror(),
+            remoteTaskObservations = report?.let {
+                if (remoteTaskObservations.isEmpty()) observeRemoteTasks(it) else remoteTaskObservations
+            } ?: remoteTaskObservations,
             locationChainProbe = buildLocationChainProbe(),
             injectionPlans = injectionOrchestrator.defaultPlans(),
             injectionTasks = report?.let(injectionOrchestrator::buildInjectionTasks).orEmpty(),
@@ -250,6 +324,165 @@ class Phase1RuntimeController(
     }
 
     fun isNativeHookReady(): Boolean = nativeCatchManager.isHookEngineReady()
+
+    private fun syncCurrentState() {
+        nativeCatchManager.pushMockState(stateStore.getState())
+        mockStateMirrorObservation = observeMockStateMirror()
+        preparationReport?.let { remoteTaskObservations = observeRemoteTasks(it) }
+    }
+
+    private fun observeMockStateMirror(): MockStateMirrorObservation {
+        val localFile = assetManager.privateMetadataFile(MOCK_STATE_FILE_NAME)
+        val sharedFile = assetManager.sharedMetadataFile(MOCK_STATE_FILE_NAME)
+        val localContent = localFile.takeIf { it.exists() }?.readText()
+        val sharedReport = shellExecutor.execute(
+            command = "cat ${shellQuote(sharedFile.absolutePath)}",
+            preferRoot = true,
+            timeoutMs = 5_000,
+        )
+        val sharedContent = if (sharedReport.success) sharedReport.stdout else null
+        val contentsMatch = !localContent.isNullOrBlank() &&
+            !sharedContent.isNullOrBlank() &&
+            localContent.trim() == sharedContent.trim()
+        val detail = buildString {
+            append("localExists=${localFile.exists()}")
+            append(", sharedReadable=${sharedReport.success}")
+            if (!sharedReport.success) {
+                append(", sharedReadSummary=${sharedReport.summary}")
+            }
+            append(", contentsMatch=$contentsMatch")
+        }
+        return MockStateMirrorObservation(
+            localPath = localFile.absolutePath,
+            localContent = localContent,
+            sharedPath = sharedFile.absolutePath,
+            sharedContent = sharedContent,
+            contentsMatch = contentsMatch,
+            detail = detail,
+            observedAtMillis = System.currentTimeMillis(),
+        )
+    }
+
+    private fun observeRemoteTasks(report: RuntimePreparationReport): List<RemoteTaskObservation> {
+        return injectionOrchestrator.buildInjectionTasks(report).map { task ->
+            val logReport = readRemoteFile(task.logFilePath)
+            val markerReport = readRemoteFile(task.markerFilePath)
+            val planReport = readRemoteFile(task.planFilePath)
+            val markerMap = parseKeyValueLines(markerReport.second)
+            val markerStatus = markerMap["status"]
+            val ptraceProbeOk = markerMap["ptrace_probe_ok"]?.toBooleanStrictOrNull()
+            val remotePossible = markerMap["remote_possible"]?.toBooleanStrictOrNull()
+            val remoteExecuted = markerMap["remote_executed"]?.toBooleanStrictOrNull()
+            val loaderResultCode = markerMap["loader_result_code"]?.toIntOrNull()
+            val remoteAttachStatus = extractPhaseStatus(logReport.second, "remote_attach_probe")
+            val remoteSymbolPlanStatus = extractPhaseStatus(logReport.second, "remote_symbol_plan")
+            val entryDispatchStatus = extractPhaseStatus(logReport.second, "entry_dispatch")
+            val hookInstallSummary = extractHookInstallSummary(logReport.second)
+            val sharedMockStateVisible = when {
+                logReport.second?.contains("shared_mock_state status=ok") == true -> true
+                logReport.second?.contains("shared_mock_state status=failed") == true -> false
+                else -> null
+            }
+            val overallSuccess = (
+                markerStatus == "remote_loader_ok" || markerStatus == "local_loader_ok"
+                ) && loaderResultCode == 0 &&
+                entryDispatchStatus == "ok" &&
+                sharedMockStateVisible != false
+            RemoteTaskObservation(
+                processName = task.plan.processName,
+                stage = task.plan.stage.name,
+                logFilePath = task.logFilePath,
+                logExcerpt = logReport.second,
+                markerFilePath = task.markerFilePath,
+                markerContent = markerReport.second,
+                planFilePath = task.planFilePath,
+                planContent = planReport.second,
+                markerStatus = markerStatus,
+                ptraceProbeOk = ptraceProbeOk,
+                remotePossible = remotePossible,
+                remoteExecuted = remoteExecuted,
+                loaderResultCode = loaderResultCode,
+                remoteAttachStatus = remoteAttachStatus,
+                remoteSymbolPlanStatus = remoteSymbolPlanStatus,
+                entryDispatchStatus = entryDispatchStatus,
+                hookInstallSummary = hookInstallSummary,
+                sharedMockStateVisible = sharedMockStateVisible,
+                overallSuccess = overallSuccess,
+                detail = buildString {
+                    append("logRead=${logReport.first}")
+                    append(", markerRead=${markerReport.first}")
+                    append(", planRead=${planReport.first}")
+                    append(", overallSuccess=$overallSuccess")
+                    markerStatus?.let { append(", markerStatus=$it") }
+                    ptraceProbeOk?.let { append(", ptraceProbeOk=$it") }
+                    remotePossible?.let { append(", remotePossible=$it") }
+                    remoteExecuted?.let { append(", remoteExecuted=$it") }
+                    loaderResultCode?.let { append(", loaderResultCode=$it") }
+                    remoteAttachStatus?.let { append(", remoteAttachStatus=$it") }
+                    remoteSymbolPlanStatus?.let { append(", remoteSymbolPlanStatus=$it") }
+                    entryDispatchStatus?.let { append(", entryDispatchStatus=$it") }
+                    hookInstallSummary?.let { append(", hookInstall=$it") }
+                    sharedMockStateVisible?.let { append(", sharedMockStateVisible=$it") }
+                },
+                observedAtMillis = System.currentTimeMillis(),
+            )
+        }
+    }
+
+    private fun readRemoteFile(path: String): Pair<Boolean, String?> {
+        val report = shellExecutor.execute(
+            command = "if [ -f ${shellQuote(path)} ]; then cat ${shellQuote(path)}; fi",
+            preferRoot = true,
+            timeoutMs = 5_000,
+        )
+        if (!report.success) {
+            return false to null
+        }
+        val content = report.stdout.trim().ifBlank { null }
+        return true to content
+    }
+
+    private fun parseKeyValueLines(content: String?): Map<String, String> {
+        if (content.isNullOrBlank()) {
+            return emptyMap()
+        }
+        return content.lineSequence()
+            .map { it.trim() }
+            .filter { it.contains('=') }
+            .associate { line ->
+                val idx = line.indexOf('=')
+                line.substring(0, idx) to line.substring(idx + 1)
+            }
+    }
+
+    private fun extractPhaseStatus(content: String?, phase: String): String? {
+        if (content.isNullOrBlank()) {
+            return null
+        }
+        return content.lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.contains("phase=$phase ") }
+            ?.let { line ->
+                Regex("""status=([^\s]+)""").find(line)?.groupValues?.getOrNull(1)
+            }
+    }
+
+    private fun extractHookInstallSummary(content: String?): String? {
+        if (content.isNullOrBlank()) {
+            return null
+        }
+        val hookBridgeLine = content.lineSequence()
+            .map { it.trim() }
+            .lastOrNull { it.startsWith("hook_bridge_phase=install_hooks") }
+        return hookBridgeLine?.let { line ->
+            val status = Regex("""status=([^\s]+)""").find(line)?.groupValues?.getOrNull(1)
+            val installed = Regex("""installed=([^\s]+)""").find(line)?.groupValues?.getOrNull(1)
+            buildString {
+                append(status ?: "unknown")
+                installed?.let { append(" installed=$it") }
+            }
+        }
+    }
 
     private fun buildLocationChainProbe(): LocationChainProbe {
         val state = stateStore.getState()
@@ -309,5 +542,24 @@ class Phase1RuntimeController(
             frequencyMhz = 5745,
             rssiDbm = -42,
         )
+    }
+
+    private fun defaultDemoCells(): List<MockCellRecord> {
+        return listOf(
+            MockCellRecord(
+                mcc = 460,
+                mnc = 0,
+                lacOrTac = 1001,
+                cidOrNci = 22334455L,
+            ),
+        )
+    }
+
+    private fun shellQuote(value: String): String {
+        return "'" + value.replace("'", "'\\''") + "'"
+    }
+
+    companion object {
+        private const val MOCK_STATE_FILE_NAME = "mock-location-state.txt"
     }
 }

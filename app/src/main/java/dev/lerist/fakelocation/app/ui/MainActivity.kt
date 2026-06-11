@@ -60,6 +60,10 @@ class MainActivity : ComponentActivity() {
                 startCoordinator(MockCoordinatorService.ACTION_UPDATE_DEMO_WIFI)
                 refreshSnapshot()
             })
+            addView(actionButton("Update Demo Cells") {
+                startCoordinator(MockCoordinatorService.ACTION_UPDATE_DEMO_CELLS)
+                refreshSnapshot()
+            })
             addView(actionButton("Run Preflight Checks") {
                 startCoordinator(MockCoordinatorService.ACTION_RUN_PREFLIGHT_CHECKS)
                 refreshSnapshot()
@@ -147,6 +151,22 @@ class MainActivity : ComponentActivity() {
         val wifiText = state.currentWifiProfile?.let {
             "${it.ssid} / ${it.bssid} / ${it.frequencyMhz}MHz / ${it.rssiDbm}dBm"
         } ?: "none"
+        val cellsText = state.currentCells.joinToString("; ") { cell ->
+            "mcc=${cell.mcc},mnc=${cell.mnc},lac/tac=${cell.lacOrTac},cid/nci=${cell.cidOrNci}"
+        }.ifBlank { "none" }
+        val nativeSyncText = snapshot.nativeLocationSyncReport?.let { report ->
+            "success=${report.success}, active=${report.active}, backend=${report.backend}, sharedPath=${report.sharedPath ?: "none"}, detail=${report.detail}, syncedAt=${report.syncedAtMillis}"
+        } ?: "none"
+        val mirrorObservationText = snapshot.mockStateMirrorObservation?.let { observation ->
+            buildString {
+                append("detail=${observation.detail}, observedAt=${observation.observedAtMillis}")
+                append("\nlocalPath=${observation.localPath}")
+                append("\nsharedPath=${observation.sharedPath}")
+                append("\ncontentsMatch=${observation.contentsMatch}")
+                append("\nlocalContent=${observation.localContent?.ifBlank { "<empty>" } ?: "<unavailable>"}")
+                append("\nsharedContent=${observation.sharedContent?.ifBlank { "<empty>" } ?: "<unavailable>"}")
+            }
+        } ?: "none"
         val locationProbe = snapshot.locationChainProbe
         val locationProbeText = buildString {
             append("consumer=${locationProbe.simulatedConsumer}, ")
@@ -227,6 +247,29 @@ class MainActivity : ComponentActivity() {
         val mirrorSyncText = snapshot.runtimeMirrorSyncResult?.let { result ->
             "summary=${result.report.summary}, exit=${result.report.exitCode}, stdout=${result.report.stdout.ifBlank { "<empty>" }}, stderr=${result.report.stderr.ifBlank { "<empty>" }}"
         } ?: "none"
+        val remoteObservationLines = snapshot.remoteTaskObservations.joinToString("\n\n") { observation ->
+            buildString {
+                append("- ${observation.processName} | ${observation.stage}")
+                append("\n  detail=${observation.detail}")
+                append("\n  overallSuccess=${observation.overallSuccess}")
+                append("\n  markerStatus=${observation.markerStatus ?: "<none>"}")
+                append("\n  ptraceProbeOk=${observation.ptraceProbeOk?.toString() ?: "<unknown>"}")
+                append("\n  remotePossible=${observation.remotePossible?.toString() ?: "<unknown>"}")
+                append("\n  remoteExecuted=${observation.remoteExecuted?.toString() ?: "<unknown>"}")
+                append("\n  loaderResultCode=${observation.loaderResultCode?.toString() ?: "<unknown>"}")
+                append("\n  remoteAttachStatus=${observation.remoteAttachStatus ?: "<none>"}")
+                append("\n  remoteSymbolPlanStatus=${observation.remoteSymbolPlanStatus ?: "<none>"}")
+                append("\n  entryDispatchStatus=${observation.entryDispatchStatus ?: "<none>"}")
+                append("\n  hookInstallSummary=${observation.hookInstallSummary ?: "<none>"}")
+                append("\n  sharedMockStateVisible=${observation.sharedMockStateVisible?.toString() ?: "<unknown>"}")
+                append("\n  logFile=${observation.logFilePath}")
+                append("\n  logExcerpt=${observation.logExcerpt ?: "<none>"}")
+                append("\n  markerFile=${observation.markerFilePath}")
+                append("\n  markerContent=${observation.markerContent ?: "<none>"}")
+                append("\n  planFile=${observation.planFilePath}")
+                append("\n  planContent=${observation.planContent ?: "<none>"}")
+            }
+        }.ifBlank { "- none" }
         val reportLines = snapshot.payloadReports.joinToString("\n") { report ->
             "- ${report.stageName}: hooks=${report.installedHooks}, services=${report.registeredServices.joinToString()}"
         }.ifBlank { "- none" }
@@ -274,7 +317,10 @@ class MainActivity : ComponentActivity() {
             appendLine("cellsEnabled=${state.toggles.cellsEnabled}")
             appendLine("location=$locationText")
             appendLine("wifi=$wifiText")
+            appendLine("cells=$cellsText")
             appendLine("lastUpdatedAtMillis=${state.lastUpdatedAtMillis}")
+            appendLine("nativeLocationSync=$nativeSyncText")
+            appendLine("mockStateMirror=$mirrorObservationText")
             appendLine()
             appendLine("Location Chain Probe")
             appendLine(locationProbeText)
@@ -301,6 +347,9 @@ class MainActivity : ComponentActivity() {
             appendLine()
             appendLine("Recommendations")
             appendLine(recommendationLines)
+            appendLine()
+            appendLine("Remote Task Observations")
+            appendLine(remoteObservationLines)
             appendLine()
             appendLine("Payload Reports")
             appendLine(reportLines)
